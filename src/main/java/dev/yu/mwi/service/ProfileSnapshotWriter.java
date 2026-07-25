@@ -1,0 +1,255 @@
+package dev.yu.mwi.service;
+
+import dev.yu.mwi.api.SharableAdapter;
+import dev.yu.mwi.config.RuntimeConfig;
+import dev.yu.mwi.domain.ProfileKey;
+import dev.yu.mwi.domain.ScopeKey;
+import dev.yu.mwi.domain.WorldIdentity;
+import dev.yu.mwi.storage.ProfileStore;
+import dev.yu.mwi.storage.StoredProfile;
+import dev.yu.mwi.storage.WorldProfile;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.server.level.ServerPlayer;
+import org.slf4j.Logger;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/** Captures live adapter state once and persists immutable profile batches in order. */
+final class ProfileSnapshotWriter implements AutoCloseable {
+    private final ProfileStore store;
+    private final Logger logger;
+    private final ProfilePersistenceQueue queue;
+    private final Map<UUID, Map<ProfileKey, StoredProfile>> workingSets = new ConcurrentHashMap<>();
+
+    ProfileSnapshotWriter(ProfileStore store, Logger logger, RuntimeConfig.Storage storage) {
+        this.store = store;
+        this.logger = logger;
+        this.queue = new ProfilePersistenceQueue(
+                storage.ioConcurrency(),
+                storage.queueCapacity(),
+                Duration.ofSeconds(storage.flushTimeoutSeconds()));
+    }
+
+    void preload(UUID playerId) throws IOException {
+        if (!workingSets.containsKey(playerId)) {
+            workingSets.put(playerId, new ConcurrentHashMap<>(store.loadPlayerProfiles(playerId)));
+        }
+    }
+
+    Optional<StoredProfile> load(ProfileKey key) {
+        Map<ProfileKey, StoredProfile> profiles = workingSets.get(key.playerId());
+        if (profiles == null) {
+            throw new IllegalStateException("Player working set was not preloaded: " + key.playerId());
+        }
+        return Optional.ofNullable(profiles.get(key));
+    }
+
+    java.util.List<WorldProfile> listWorldProfiles(UUID playerId, dev.yu.mwi.domain.GameModeBucket gameMode,
+                                                   String shareId) {
+        Map<ProfileKey, StoredProfile> profiles = workingSets.getOrDefault(playerId, Map.of());
+        return profiles.entrySet().stream()
+                .filter(entry -> entry.getKey().scope().type() == ScopeKey.Type.WORLD)
+                .filter(entry -> entry.getKey().gameMode() == gameMode)
+                .filter(entry -> entry.getKey().shareId().equals(shareId))
+                .map(entry -> new WorldProfile(entry.getKey().scope().id(), entry.getValue()))
+                .toList();
+    }
+
+    void persist(
+            ServerPlayer player,
+            WorldIdentity world,
+            Map<String, ProfileKey> keys,
+            Map<String, SharableAdapter> adapters,
+            boolean writeWorldBackups,
+            long revision,
+            String reason,
+            boolean asynchronous) throws IOException {
+        LinkedHashMap<ProfileKey, CompoundTag> writes = new LinkedHashMap<>();
+        LinkedHashMap<String, CompoundTag> captured = new LinkedHashMap<>();
+        for (Map.Entry<String, SharableAdapter> entry : adapters.entrySet()) {
+            CompoundTag payload = entry.getValue().capture(player, player.registryAccess());
+            captured.put(entry.getKey(), payload);
+            writes.put(keys.get(entry.getKey()), payload);
+        }
+        collectWorldBackups(player, world, keys, adapters, captured, writes, writeWorldBackups);
+        if (asynchronous) {
+            enqueue(player.getUUID(), revision, writes, Optional.empty(), reason);
+        } else {
+            store.commitBatch(player.getUUID(), revision, writes, Optional.empty());
+            remember(player.getUUID(), revision, writes);
+            logger.debug("Persisted {} inventory profile for {} at revision {}",
+                    reason, player.getUUID(), revision);
+        }
+    }
+
+    void enqueue(
+            java.util.UUID playerId,
+            long revision,
+            Map<ProfileKey, CompoundTag> writes,
+            Optional<CompoundTag> completedJournal,
+            String reason) {
+        enqueue(playerId, revision, writes, completedJournal, java.util.List.of(), reason);
+    }
+
+    void commitImmediately(
+            UUID playerId,
+            long revision,
+            Map<ProfileKey, CompoundTag> writes,
+            Optional<CompoundTag> completedJournal) throws IOException {
+        store.commitBatch(playerId, revision, writes, completedJournal);
+        remember(playerId, revision, writes);
+    }
+
+    void enqueue(
+            UUID playerId,
+            long revision,
+            Map<ProfileKey, CompoundTag> writes,
+            Optional<CompoundTag> completedJournal,
+            java.util.List<Archive> archives,
+            String reason) {
+        // Every tag in this map is a newly captured/constructed value whose ownership is transferred
+        // to the queue. No live Minecraft object or registry is retained by the closure.
+        Map<ProfileKey, CompoundTag> detachedWrites = java.util.Collections.unmodifiableMap(
+                new LinkedHashMap<>(writes));
+        Optional<CompoundTag> detachedJournal = completedJournal;
+        java.util.List<Archive> detachedArchives = java.util.List.copyOf(archives);
+        if (detachedJournal.isEmpty() && detachedArchives.isEmpty()) {
+            queue.submit(playerId, new CoalescingBatch(playerId, revision, detachedWrites));
+        } else {
+            queue.submit(playerId, () -> {
+                for (Archive archive : detachedArchives) {
+                    store.archive(archive.key(), archive.category(), archive.reason(), revision);
+                }
+                store.commitBatch(playerId, revision, detachedWrites, detachedJournal);
+            });
+        }
+        remember(playerId, revision, detachedWrites);
+        logger.debug("Queued {} inventory profile for {} at revision {}", reason, playerId, revision);
+    }
+
+    record Archive(ProfileKey key, String category, String reason) {
+    }
+
+    private final class CoalescingBatch implements ProfilePersistenceQueue.CoalescingIoAction {
+        private final UUID playerId;
+        private long revision;
+        private final LinkedHashMap<ProfileKey, CompoundTag> writes;
+
+        private CoalescingBatch(UUID playerId, long revision, Map<ProfileKey, CompoundTag> writes) {
+            this.playerId = playerId;
+            this.revision = revision;
+            this.writes = new LinkedHashMap<>(writes);
+        }
+
+        @Override
+        public synchronized boolean merge(ProfilePersistenceQueue.CoalescingIoAction newer) {
+            if (!(newer instanceof ProfileSnapshotWriter.CoalescingBatch batch)
+                    || !playerId.equals(batch.playerId)) {
+                return false;
+            }
+            if (batch.revision <= revision) {
+                return true;
+            }
+            writes.putAll(batch.writes);
+            revision = batch.revision;
+            return true;
+        }
+
+        @Override
+        public synchronized void run() throws IOException {
+            store.commitBatch(
+                    playerId,
+                    revision,
+                    java.util.Collections.unmodifiableMap(new LinkedHashMap<>(writes)),
+                    Optional.empty());
+        }
+    }
+
+    private void remember(UUID playerId, long revision, Map<ProfileKey, CompoundTag> writes) {
+        Map<ProfileKey, StoredProfile> profiles = workingSets.computeIfAbsent(
+                playerId, ignored -> new ConcurrentHashMap<>());
+        Instant capturedAt = Instant.now();
+        writes.forEach((key, payload) -> profiles.put(
+                key, new StoredProfile(payload, revision, capturedAt, "pending:" + revision)));
+    }
+
+    void forget(UUID playerId) {
+        workingSets.remove(playerId);
+    }
+
+    void preserveQuarantined(
+            ServerPlayer player,
+            Map<String, SharableAdapter> adapters,
+            String reason,
+            long revision) throws IOException {
+        IOException aggregate = null;
+        for (Map.Entry<String, SharableAdapter> entry : adapters.entrySet()) {
+            try {
+                CompoundTag payload = entry.getValue().capture(player, player.registryAccess());
+                store.writeLostFound(player.getUUID(), entry.getKey(), payload, reason, revision);
+            } catch (IOException | RuntimeException failure) {
+                if (aggregate == null) {
+                    aggregate = new IOException("Unable to preserve every quarantined share");
+                }
+                aggregate.addSuppressed(failure);
+            }
+        }
+        if (aggregate != null) {
+            throw aggregate;
+        }
+    }
+
+    void throwIfFailed(java.util.UUID playerId) throws IOException {
+        queue.throwIfFailed(playerId);
+    }
+
+    void flush(java.util.UUID playerId) throws IOException {
+        queue.flush(playerId);
+    }
+
+    void flushAll() throws IOException {
+        queue.flushAll();
+    }
+
+    ProfilePersistenceQueue.Metrics metrics() {
+        return queue.metrics();
+    }
+
+    @Override
+    public void close() throws IOException {
+        queue.close();
+    }
+
+    static void collectWorldBackups(
+            ServerPlayer player,
+            WorldIdentity world,
+            Map<String, ProfileKey> activeKeys,
+            Map<String, SharableAdapter> adapters,
+            Map<String, CompoundTag> overrides,
+            Map<ProfileKey, CompoundTag> writes,
+            boolean enabled) {
+        if (!enabled) {
+            return;
+        }
+        for (Map.Entry<String, SharableAdapter> entry : adapters.entrySet()) {
+            ProfileKey activeKey = activeKeys.get(entry.getKey());
+            if (activeKey == null) {
+                continue;
+            }
+            ProfileKey backup = new ProfileKey(
+                    player.getUUID(), ScopeKey.world(world), activeKey.gameMode(), entry.getKey());
+            CompoundTag payload = overrides.get(entry.getKey());
+            if (payload == null) {
+                payload = entry.getValue().capture(player, player.registryAccess());
+            }
+            writes.put(backup, payload);
+        }
+    }
+}
