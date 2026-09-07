@@ -73,7 +73,7 @@ public final class NeoForgeEventHandler {
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onDimensionChanged(PlayerEvent.PlayerChangedDimensionEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
-            runPlayerEvent(player, () -> controller.dimensionChanged(player));
+            runPlayerEvent(player, () -> controller.dimensionChanged(player, event.getFrom(), event.getTo()));
         }
     }
 

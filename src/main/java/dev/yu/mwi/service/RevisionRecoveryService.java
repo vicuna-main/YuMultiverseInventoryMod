@@ -1,6 +1,8 @@
 package dev.yu.mwi.service;
 
 import dev.yu.mwi.api.SharableAdapter;
+import dev.yu.mwi.adapter.vanilla.AdvancementAdapter;
+import dev.yu.mwi.config.MwiConfig;
 import dev.yu.mwi.domain.ProfileKey;
 import dev.yu.mwi.domain.WorldIdentity;
 import dev.yu.mwi.storage.PendingTransactionException;
@@ -28,7 +30,8 @@ final class RevisionRecoveryService {
             long requestedRevision,
             WorldIdentity currentWorld,
             Map<String, ProfileKey> activeProfiles,
-            Map<String, SharableAdapter> adapters) throws RecoveryException {
+            Map<String, SharableAdapter> adapters,
+            MwiConfig.AdvancementMigration advancementMigration) throws RecoveryException {
         LinkedHashMap<SharableAdapter, CompoundTag> liveBefore = new LinkedHashMap<>();
         long recoveryRevision = -1L;
         CompoundTag recoveryJournal = null;
@@ -36,7 +39,11 @@ final class RevisionRecoveryService {
             CompoundTag sourceJournal = store.loadRevision(player.getUUID(), requestedRevision)
                     .orElseThrow(() -> new RecoveryException(
                             "Revision not found: " + requestedRevision, null, false));
-            List<TransitionJournal.RecoveredChange> recovered = TransitionJournal.recoverBefore(sourceJournal);
+            List<TransitionJournal.RecoveredChange> recovered = prepareAdvancements(
+                    player,
+                    TransitionJournal.recoverBefore(sourceJournal),
+                    adapters,
+                    advancementMigration);
             LinkedHashMap<ProfileKey, StoredProfile> diskBefore = validateAndCapture(
                     player, recovered, activeProfiles, adapters, liveBefore);
             LinkedHashMap<SharableAdapter, CompoundTag> liveRecovery = liveRecovery(
@@ -87,6 +94,23 @@ final class RevisionRecoveryService {
             throw new RecoveryException(
                     "Unable to recover revision " + requestedRevision, failure, unsafe);
         }
+    }
+
+    private static List<TransitionJournal.RecoveredChange> prepareAdvancements(
+            ServerPlayer player,
+            List<TransitionJournal.RecoveredChange> recovered,
+            Map<String, SharableAdapter> adapters,
+            MwiConfig.AdvancementMigration migration) {
+        return recovered.stream().map(change -> {
+            SharableAdapter adapter = adapters.get(change.shareId());
+            if (!(adapter instanceof AdvancementAdapter advancements)) {
+                return change;
+            }
+            CompoundTag normalized = advancements.prepare(
+                    player.server.getAdvancements(), change.payload(), migration).payload();
+            return new TransitionJournal.RecoveredChange(
+                    change.shareId(), change.fromKey(), change.toKey(), normalized);
+        }).toList();
     }
 
     private LinkedHashMap<ProfileKey, StoredProfile> validateAndCapture(

@@ -35,6 +35,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.StreamSupport;
 
@@ -69,10 +70,102 @@ public final class MwiCommands {
                 .then(Commands.literal("reload")
                         .executes(context -> execute(context.getSource(),
                                 source -> reload(source, controller))))
+                .then(Commands.literal("status")
+                        .executes(context -> execute(context.getSource(),
+                                source -> cacheStats(source, controller))))
                 .then(Commands.literal("cache")
                         .then(Commands.literal("stats")
                                 .executes(context -> execute(context.getSource(),
-                                        source -> cacheStats(source, controller)))))
+                                        source -> cacheStats(source, controller))))
+                        .then(Commands.literal("invalidate")
+                                .then(Commands.literal("player")
+                                        .then(Commands.argument("player_identity", StringArgumentType.word())
+                                                .executes(context -> execute(context.getSource(), source ->
+                                                        invalidatePlayerCache(
+                                                                source,
+                                                                controller,
+                                                                StringArgumentType.getString(
+                                                                        context, "player_identity"))))))))
+                .then(Commands.literal("repair")
+                        .then(Commands.literal("missing-items")
+                                .then(Commands.literal("scan")
+                                        .then(Commands.literal("player")
+                                                .then(Commands.argument(
+                                                                "missing_item_player", StringArgumentType.word())
+                                                        .then(Commands.literal("--dry-run")
+                                                                .executes(context -> execute(
+                                                                        context.getSource(), source -> repairMissingItems(
+                                                                                source, controller,
+                                                                                StringArgumentType.getString(
+                                                                                        context, "missing_item_player"),
+                                                                                false))))))
+                                        .then(Commands.literal("all")
+                                                .then(Commands.literal("--dry-run")
+                                                        .executes(context -> execute(
+                                                                context.getSource(), source ->
+                                                                        repairMissingItemsAll(
+                                                                                source, controller, false))))))
+                                .then(Commands.literal("apply")
+                                        .then(Commands.literal("player")
+                                                .then(Commands.argument(
+                                                                "missing_item_apply_player", StringArgumentType.word())
+                                                        .executes(context -> execute(
+                                                                context.getSource(), source -> repairMissingItems(
+                                                                        source, controller,
+                                                                StringArgumentType.getString(
+                                                                                context, "missing_item_apply_player"),
+                                                                        true))))))
+                                        .then(Commands.literal("all")
+                                                .executes(context -> execute(
+                                                        context.getSource(), source ->
+                                                                repairMissingItemsAll(source, controller, true)))))
+                        .then(Commands.literal("player")
+                                .then(Commands.argument("player_identity", StringArgumentType.word())
+                                        .then(Commands.literal("advancements")
+                                                .then(Commands.literal("--dry-run")
+                                                        .executes(context -> execute(
+                                                                context.getSource(), source -> repairAdvancements(
+                                                                        source, controller,
+                                                                        StringArgumentType.getString(
+                                                                                context, "player_identity"),
+                                                                        false))))
+                                                .then(Commands.literal("--apply")
+                                                        .executes(context -> execute(
+                                                                context.getSource(), source -> repairAdvancements(
+                                                                        source, controller,
+                                                                        StringArgumentType.getString(
+                                                                                context, "player_identity"),
+                                                                        true)))))
+                                        .then(Commands.literal("missing-items")
+                                                .then(Commands.literal("--dry-run")
+                                                        .executes(context -> execute(
+                                                                context.getSource(), source -> repairMissingItems(
+                                                                        source, controller,
+                                                                        StringArgumentType.getString(
+                                                                                context, "player_identity"), false))))
+                                                .then(Commands.literal("--apply")
+                                                        .executes(context -> execute(
+                                                                context.getSource(), source -> repairMissingItems(
+                                                                source, controller,
+                                                                StringArgumentType.getString(
+                                                                                context, "player_identity"), true)))))
+                                        .then(Commands.literal("bed-spawn")
+                                                .then(Commands.literal("--dry-run")
+                                                        .executes(context -> execute(
+                                                                context.getSource(), source -> inspectBedSpawn(
+                                                                        source, controller,
+                                                                        StringArgumentType.getString(
+                                                                                context, "player_identity")))))
+                                                .then(Commands.literal("--clear")
+                                                        .then(Commands.argument(
+                                                                        "bed_spawn_scope", StringArgumentType.greedyString())
+                                                                .executes(context -> execute(
+                                                                        context.getSource(), source -> clearBedSpawn(
+                                                                                source, controller,
+                                                                                StringArgumentType.getString(
+                                                                                        context, "player_identity"),
+                                                                                StringArgumentType.getString(
+                                                                                        context, "bed_spawn_scope"))))))))))
                 .then(Commands.literal("recover")
                         .then(Commands.argument("player", EntityArgument.player())
                                 .then(Commands.argument("revision", LongArgumentType.longArg(1L))
@@ -81,6 +174,25 @@ public final class MwiCommands {
                                                 controller,
                                                 EntityArgument.getPlayer(context, "player"),
                                                 LongArgumentType.getLong(context, "revision")))))))
+                .then(Commands.literal("quarantine")
+                        .then(Commands.literal("missing-items")
+                                .then(Commands.literal("list")
+                                        .then(Commands.argument("archive_player", StringArgumentType.word())
+                                                .executes(context -> execute(
+                                                        context.getSource(), source -> listMissingItemArchives(
+                                                                source, controller,
+                                                                StringArgumentType.getString(
+                                                                        context, "archive_player"))))))
+                                .then(Commands.literal("restore")
+                                        .then(Commands.argument("restore_player", StringArgumentType.word())
+                                                .then(Commands.argument("archive_entry", StringArgumentType.word())
+                                                        .executes(context -> execute(
+                                                                context.getSource(), source -> restoreMissingItem(
+                                                                        source, controller,
+                                                                        StringArgumentType.getString(
+                                                                                context, "restore_player"),
+                                                                        StringArgumentType.getString(
+                                                                                context, "archive_entry")))))))))
                 .then(Commands.literal("group")
                         .then(Commands.literal("create")
                                 .then(Commands.argument("name", StringArgumentType.word())
@@ -376,6 +488,8 @@ public final class MwiCommands {
                 + ", bytes=" + stats.bytes() + '/' + stats.maxBytes()
                 + ", hits=" + stats.hits()
                 + ", misses=" + stats.misses()
+                + ", evictions=" + stats.evictions()
+                + ", oversized_rejected=" + stats.oversizedRejected()
                 + ", hit rate=" + hitRate);
         InventoryIsolationService.PersistenceMetrics persistence =
                 controller.requireService().persistenceMetrics();
@@ -385,6 +499,15 @@ public final class MwiCommands {
                 + ", p99_ms=" + persistence.p99WriteLatencyMillis()
                 + ", failures=" + persistence.failures()
                 + ", coalesced=" + persistence.coalesced()
+                + ", queued_total=" + persistence.queued()
+                + ", rejected=" + persistence.rejected()
+                + ", active_workers=" + persistence.activeWorkers()
+                + ", commit_p95_ms=" + persistence.p95CommitLatencyMillis()
+                + ", commit_p99_ms=" + persistence.p99CommitLatencyMillis()
+                + ", quarantined_players=" + persistence.quarantinedPlayers()
+                + ", quarantine_events=" + persistence.quarantineEvents()
+                + ", revision_p95_ms=" + persistence.p95RevisionAllocationLatencyMillis()
+                + ", revision_p99_ms=" + persistence.p99RevisionAllocationLatencyMillis()
                 + ", capture_p95_ms=" + persistence.p95CaptureLatencyMillis()
                 + ", capture_p99_ms=" + persistence.p99CaptureLatencyMillis());
         InventoryIsolationService.LoginPerformanceMetrics login =
@@ -396,7 +519,204 @@ public final class MwiCommands {
                 + ", capture_max_batch_ms=" + login.maxCaptureBatchMillis()
                 + ", sync_total_ms=" + login.totalSynchronizationMillis()
                 + ", sync_max_ms=" + login.maxSynchronizationMillis());
+        InventoryIsolationService.CompatibilityMetrics compatibility =
+                controller.requireService().compatibilityMetrics();
+        success(source, "Advancement compatibility: staleAdvancementsSkipped="
+                + compatibility.staleAdvancementsSkipped()
+                + ", staleCriteriaSkipped=" + compatibility.staleCriteriaSkipped()
+                + ", profilesCompatibilityDegraded=" + compatibility.profilesCompatibilityDegraded()
+                + ", advancementAliasesMigrated=" + compatibility.advancementAliasesMigrated()
+                + ", criterionAliasesMigrated=" + compatibility.criterionAliasesMigrated());
+        success(source, "Item compatibility: policy="
+                + controller.requireService().snapshot().config().model().itemMigration().missingItemPolicy()
+                        .name().toLowerCase(java.util.Locale.ROOT)
+                + ", missingItemStacksQuarantined=" + compatibility.missingItemStacksQuarantined()
+                + ", missingComponentStacksQuarantined=" + compatibility.missingComponentStacksQuarantined()
+                + ", itemAliasesApplied=" + compatibility.itemAliasesApplied()
+                + ", missingItemRepairFailures=" + compatibility.missingItemRepairFailures());
         return 1;
+    }
+
+    private static int invalidatePlayerCache(
+            CommandSourceStack source,
+            MwiServerController controller,
+            String identity) throws Exception {
+        UUID playerId = resolvePlayerId(controller, identity);
+        int removed = controller.requireService().invalidatePlayerCache(playerId);
+        success(source, "Invalidated profile cache for " + playerId + "; removed entries=" + removed);
+        return 1;
+    }
+
+    private static int inspectBedSpawn(
+            CommandSourceStack source,
+            MwiServerController controller,
+            String identity) throws Exception {
+        UUID playerId = resolvePlayerId(controller, identity);
+        InventoryIsolationService.BedSpawnRepairReport report =
+                controller.requireService().inspectBedSpawn(playerId);
+        describeBedSpawnReport(source, playerId, "dry-run", report);
+        return 1;
+    }
+
+    private static int clearBedSpawn(
+            CommandSourceStack source,
+            MwiServerController controller,
+            String identity,
+            String scopeSelector) throws Exception {
+        UUID playerId = resolvePlayerId(controller, identity);
+        InventoryIsolationService.BedSpawnRepairReport report =
+                controller.requireService().clearBedSpawn(playerId, scopeSelector);
+        describeBedSpawnReport(source, playerId, "clear " + scopeSelector, report);
+        if (report.matchedProfiles() == 0) {
+            failure(source, "No bed-spawn profile matched scope " + scopeSelector);
+            return 0;
+        }
+        return 1;
+    }
+
+    private static void describeBedSpawnReport(
+            CommandSourceStack source,
+            UUID playerId,
+            String action,
+            InventoryIsolationService.BedSpawnRepairReport report) {
+        success(source, "Bed-spawn " + action + " for " + playerId
+                + ": scanned profiles=" + report.scannedProfiles()
+                + ", matched profiles=" + report.matchedProfiles()
+                + ", cleared profiles=" + report.clearedProfiles()
+                + ", revision=" + (report.revision() == 0L ? "none" : report.revision())
+                + ", applied=" + report.applied());
+        report.profiles().stream().limit(MAX_RELOAD_DETAILS).forEach(entry -> success(source,
+                "  scope=" + entry.scopeSelector()
+                        + " gameMode=" + entry.key().gameMode().name().toLowerCase(java.util.Locale.ROOT)
+                        + " profileRevision=" + entry.profileRevision()
+                        + " present=" + entry.present()
+                        + " dimension=" + entry.dimension().orElse("none")
+                        + " loaded=" + entry.loaded().map(value -> Boolean.toString(value)).orElse("n/a")
+                        + " validation=" + entry.validationError().orElse("valid")));
+        if (report.profiles().size() > MAX_RELOAD_DETAILS) {
+            success(source, "  ... and " + (report.profiles().size() - MAX_RELOAD_DETAILS) + " more profiles");
+        }
+    }
+
+    private static int repairAdvancements(
+            CommandSourceStack source,
+            MwiServerController controller,
+            String identity,
+            boolean apply) throws Exception {
+        UUID playerId = resolvePlayerId(controller, identity);
+        InventoryIsolationService.AdvancementRepairReport report =
+                controller.requireService().repairAdvancements(playerId, apply);
+        String action = apply ? "apply" : "dry-run";
+        success(source, "Advancement repair " + action + " for " + playerId
+                + ": scanned profiles=" + report.scannedProfiles()
+                + ", modified profiles=" + report.modifiedProfiles()
+                + ", advancement aliases=" + report.advancementAliasesMigrated()
+                + ", criterion aliases=" + report.criterionAliasesMigrated()
+                + ", stale advancements=" + report.staleAdvancementsSkipped()
+                + ", stale criteria=" + report.staleCriteriaSkipped()
+                + ", archive revision="
+                + (report.archiveRevision() == 0L ? "none" : report.archiveRevision()));
+        report.errors().stream().limit(MAX_RELOAD_DETAILS)
+                .forEach(error -> failure(source, "  " + error));
+        if (report.errors().size() > MAX_RELOAD_DETAILS) {
+            failure(source, "  ... and " + (report.errors().size() - MAX_RELOAD_DETAILS) + " more errors");
+        }
+        if (!report.errors().isEmpty()) {
+            failure(source, "No profiles were modified because strict validation found errors");
+            return 0;
+        }
+        if (apply && report.modifiedProfiles() > 0 && !report.applied()) {
+            failure(source, "No profiles were modified");
+            return 0;
+        }
+        return 1;
+    }
+
+    private static int repairMissingItems(
+            CommandSourceStack source,
+            MwiServerController controller,
+            String identity,
+            boolean apply) throws Exception {
+        UUID playerId = resolvePlayerId(controller, identity);
+        InventoryIsolationService.MissingItemRepairReport report =
+                controller.requireService().repairMissingItems(playerId, apply);
+        success(source, "Missing-item repair " + (apply ? "apply" : "dry-run") + " for " + playerId
+                + ": scanned profiles=" + report.scannedProfiles()
+                + ", modified profiles=" + report.modifiedProfiles()
+                + ", quarantined stacks=" + report.quarantinedStacks()
+                + ", missing items=" + report.missingItemStacks()
+                + ", missing components=" + report.missingComponentStacks()
+                + ", aliases=" + report.aliasesApplied()
+                + ", archive revision="
+                + (report.archiveRevision() == 0L ? "none" : report.archiveRevision())
+                + ", by namespace=" + report.byNamespace()
+                + ", by share=" + report.byShare());
+        report.errors().stream().limit(MAX_RELOAD_DETAILS)
+                .forEach(error -> failure(source, "  " + error));
+        if (!report.errors().isEmpty()) {
+            failure(source, "No profiles were modified because strict validation found errors");
+            return 0;
+        }
+        return apply && report.modifiedProfiles() > 0 && !report.applied() ? 0 : 1;
+    }
+
+    private static int listMissingItemArchives(
+            CommandSourceStack source, MwiServerController controller, String identity) throws Exception {
+        UUID playerId = resolvePlayerId(controller, identity);
+        List<InventoryIsolationService.MissingItemArchiveSummary> entries =
+                controller.requireService().listMissingItemArchives(playerId);
+        success(source, "Missing-item quarantine entries for " + playerId + ": " + entries.size());
+        entries.stream().limit(MAX_RELOAD_DETAILS).forEach(entry -> success(source,
+                "  " + entry.entryId() + " | " + entry.logicalSlot() + " | " + entry.itemId()
+                        + " | " + entry.reason() + " | revision=" + entry.archiveRevision()));
+        if (entries.size() > MAX_RELOAD_DETAILS) {
+            success(source, "  ... and " + (entries.size() - MAX_RELOAD_DETAILS) + " more");
+        }
+        return 1;
+    }
+
+    private static int repairMissingItemsAll(
+            CommandSourceStack source, MwiServerController controller, boolean apply) throws Exception {
+        InventoryIsolationService.MissingItemBatchRepairReport report =
+                controller.requireService().repairMissingItemsAll(apply);
+        success(source, "Missing-item " + (apply ? "apply" : "scan") + " batch: players="
+                + report.processedPlayers() + '/' + report.availablePlayers()
+                + ", profiles=" + report.scannedProfiles()
+                + ", modified profiles=" + report.modifiedProfiles()
+                + ", quarantined stacks=" + report.quarantinedStacks()
+                + ", applied players=" + report.appliedPlayers()
+                + ", truncated=" + report.truncated());
+        report.errors().stream().limit(MAX_RELOAD_DETAILS)
+                .forEach(error -> failure(source, "  " + error));
+        if (report.truncated()) {
+            success(source, "Run the same command again to continue from the bounded batch cursor");
+        }
+        return report.errors().isEmpty() ? 1 : 0;
+    }
+
+    private static int restoreMissingItem(
+            CommandSourceStack source,
+            MwiServerController controller,
+            String identity,
+            String entryId) throws Exception {
+        UUID playerId = resolvePlayerId(controller, identity);
+        InventoryIsolationService.MissingItemRestoreReport report =
+                controller.requireService().restoreMissingItem(playerId, entryId);
+        success(source, "Restored quarantine entry " + entryId + " to " + report.logicalSlot()
+                + " at revision " + report.revision());
+        return 1;
+    }
+
+    private static UUID resolvePlayerId(MwiServerController controller, String identity) {
+        try {
+            return UUID.fromString(identity);
+        } catch (IllegalArgumentException notUuid) {
+            try {
+                return controller.requireService().resolveKnownPlayerName(identity);
+            } catch (dev.yu.mwi.service.TransitionException failure) {
+                throw new IllegalArgumentException(failure.getMessage(), failure);
+            }
+        }
     }
 
     private static int recover(

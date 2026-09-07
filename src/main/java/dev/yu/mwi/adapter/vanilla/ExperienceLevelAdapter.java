@@ -17,6 +17,7 @@ public final class ExperienceLevelAdapter extends AbstractVanillaAdapter {
     public CompoundTag capture(ServerPlayer player, HolderLookup.Provider lookup) {
         CompoundTag data = new CompoundTag();
         data.putInt(LEVEL, player.experienceLevel);
+        validatePayload(data, id().toString());
         return data;
     }
 
@@ -27,12 +28,16 @@ public final class ExperienceLevelAdapter extends AbstractVanillaAdapter {
 
     @Override
     public void apply(ServerPlayer player, CompoundTag data, HolderLookup.Provider lookup) {
-        NbtPayload.requireData(data, id().toString());
-        int level = NbtPayload.requireInt(data, LEVEL, id().toString());
+        player.experienceLevel = validatePayload(data, id().toString());
+    }
+
+    static int validatePayload(CompoundTag data, String adapterId) {
+        NbtPayload.requireData(data, adapterId);
+        int level = NbtPayload.requireInt(data, LEVEL, adapterId);
         if (level < 0) {
-            throw NbtPayload.invalid(id().toString(), "level must be non-negative");
+            throw NbtPayload.invalid(adapterId, "level must be non-negative");
         }
-        player.experienceLevel = level;
+        return level;
     }
 
     @Override

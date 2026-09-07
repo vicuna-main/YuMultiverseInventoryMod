@@ -19,6 +19,13 @@ public interface ProfileStore extends AutoCloseable {
         return Map.of();
     }
 
+    /** Reads and validates a player working set without changing caches, files, or revision state. */
+    Map<ProfileKey, StoredProfile> inspectPlayerProfiles(UUID playerId) throws IOException;
+
+    default PlayerProfileIds listPlayerProfileIds() throws IOException {
+        return new PlayerProfileIds(List.of());
+    }
+
     SaveResult save(ProfileKey key, CompoundTag payload, long revision) throws IOException;
 
     /** Durably commits a set of profile writes and an optional completed revision journal. */
@@ -38,7 +45,23 @@ public interface ProfileStore extends AutoCloseable {
         }
     }
 
+    default void commitBatch(
+            UUID playerId,
+            long revision,
+            Map<ProfileKey, CompoundTag> profiles,
+            Optional<CompoundTag> completedJournal,
+            List<ProfileArchive> archives) throws IOException {
+        for (ProfileArchive archive : archives) {
+            archive(archive.key(), archive.category(), archive.reason(), revision, archive.details());
+        }
+        commitBatch(playerId, revision, profiles, completedJournal);
+    }
+
     void delete(ProfileKey key) throws IOException;
+
+    void invalidate(ProfileKey key);
+
+    void invalidatePlayer(UUID playerId);
 
     long nextRevision(UUID playerId) throws IOException;
 
@@ -54,6 +77,15 @@ public interface ProfileStore extends AutoCloseable {
     }
 
     void archive(ProfileKey key, String category, String reason, long revision) throws IOException;
+
+    default void archive(
+            ProfileKey key, String category, String reason, long revision, CompoundTag details) throws IOException {
+        archive(key, category, reason, revision);
+    }
+
+    default List<CompatibilityArchiveEntry> listCompatibilityArchives(UUID playerId) throws IOException {
+        return List.of();
+    }
 
     void writeLostFound(UUID playerId, String shareId, CompoundTag payload, String reason, long revision)
             throws IOException;

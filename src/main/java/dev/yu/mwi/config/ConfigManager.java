@@ -13,6 +13,7 @@ import com.google.gson.JsonParser;
 import dev.yu.mwi.domain.ShareCatalog;
 import dev.yu.mwi.domain.WorldGroup;
 import dev.yu.mwi.domain.WorldSelector;
+import net.minecraft.resources.ResourceLocation;
 
 import java.io.IOException;
 import java.io.StringReader;
@@ -127,7 +128,7 @@ public final class ConfigManager {
     private static RuntimeConfig parse(UnmodifiableConfig root) {
         rejectUnknownKeys(root, "configuration root", Set.of(
                 "_documentation", "schema_version", "share_handling", "share_aliases", "group_order", "groups",
-                "migration", "storage", "mvinv_compat"));
+                "migration", "advancement_migration", "item_migration", "storage", "mvinv_compat"));
         int schema = integer(root, "schema_version", 1);
         UnmodifiableConfig handling = table(root, "share_handling", Config.inMemory());
         rejectUnknownKeys(handling, "share_handling", Set.of("_documentation", "enable_gamemode_profiles",
@@ -149,6 +150,28 @@ public final class ConfigManager {
         MwiConfig.Migration migrationModel = new MwiConfig.Migration(policy, optionalString(migration, "preferred_world"),
                 bool(migration, "archive_conflicts", true), bool(migration, "notify_admins", true));
 
+        UnmodifiableConfig advancementMigration = table(root, "advancement_migration", Config.inMemory());
+        rejectUnknownKeys(advancementMigration, "advancement_migration",
+                Set.of("_documentation", "aliases", "criterion_aliases"));
+        Map<ResourceLocation, ResourceLocation> advancementAliases =
+                parseResourceAliases(table(advancementMigration, "aliases", null));
+        Map<ResourceLocation, Map<String, String>> criterionAliases =
+                parseCriterionAliases(table(advancementMigration, "criterion_aliases", null));
+        MwiConfig.AdvancementMigration advancementMigrationModel =
+                new MwiConfig.AdvancementMigration(advancementAliases, criterionAliases);
+
+        UnmodifiableConfig itemMigration = table(root, "item_migration", Config.inMemory());
+        rejectUnknownKeys(itemMigration, "item_migration",
+                Set.of("_documentation", "missing_item_policy", "aliases"));
+        MwiConfig.MissingItemPolicy missingItemPolicy = parseEnum(
+                MwiConfig.MissingItemPolicy.class,
+                string(itemMigration, "missing_item_policy", "quarantine_and_continue"),
+                "item_migration.missing_item_policy");
+        Map<ResourceLocation, ResourceLocation> itemAliases =
+                parseResourceAliases(table(itemMigration, "aliases", null), "item_migration.aliases");
+        MwiConfig.ItemMigration itemMigrationModel =
+                new MwiConfig.ItemMigration(missingItemPolicy, itemAliases);
+
         UnmodifiableConfig storageTable = table(root, "storage", Config.inMemory());
         rejectUnknownKeys(storageTable, "storage", Set.of(
                 "_documentation", "max_revisions", "cache_entries", "cache_megabytes",
@@ -160,7 +183,8 @@ public final class ConfigManager {
         UnmodifiableConfig compatibility = table(root, "mvinv_compat", Config.inMemory());
         rejectUnknownKeys(compatibility, "mvinv_compat", Set.of("_documentation", "mode", "data_directory"));
 
-        MwiConfig model = new MwiConfig(shareHandling, aliases, groups, migrationModel);
+        MwiConfig model = new MwiConfig(
+                shareHandling, aliases, groups, migrationModel, advancementMigrationModel, itemMigrationModel);
         model.createGroupResolver(new ShareCatalog(ShareCatalog.STANDARD_LEAF_SHARES, aliases));
         return new RuntimeConfig(schema, model, storage,
                 RuntimeConfig.MvinvMode.parse(string(compatibility, "mode", "import_and_replace")),
@@ -214,6 +238,38 @@ public final class ConfigManager {
         runtime.model().migration().preferredWorld().ifPresent(value -> migration.set("preferred_world", value));
         migration.set("archive_conflicts", runtime.model().migration().archiveConflicts());
         migration.set("notify_admins", runtime.model().migration().notifyAdmins());
+        MwiConfig.AdvancementMigration configuredAdvancementMigration =
+                runtime.model().advancementMigration();
+        if (!configuredAdvancementMigration.aliases().isEmpty()
+                || !configuredAdvancementMigration.criterionAliases().isEmpty()) {
+            CommentedConfig advancementMigration = section(
+                    root, "advancement_migration", "进度或 criterion 改名的显式迁移别名；支持 /mwi reload 热重载。");
+            if (!configuredAdvancementMigration.aliases().isEmpty()) {
+                CommentedConfig advancementAliases = section(
+                        advancementMigration, "aliases", "旧进度 ID 到当前进度 ID 的一对一别名。");
+                configuredAdvancementMigration.aliases().forEach(
+                        (source, target) -> advancementAliases.set(source.toString(), target.toString()));
+            }
+            if (!configuredAdvancementMigration.criterionAliases().isEmpty()) {
+                CommentedConfig criterionAliases = section(
+                        advancementMigration, "criterion_aliases", "按目标进度 ID 限定的 criterion 改名。");
+                configuredAdvancementMigration.criterionAliases().forEach((advancement, mappings) -> {
+                    CommentedConfig scoped = CommentedConfig.inMemory();
+                    mappings.forEach(scoped::set);
+                    criterionAliases.set(advancement.toString(), scoped);
+                });
+            }
+        }
+        CommentedConfig itemMigration = section(
+                root, "item_migration", "缺失物品隔离策略和显式物品 ID 改名；支持 /mwi reload 热重载。");
+        itemMigration.set("missing_item_policy",
+                runtime.model().itemMigration().missingItemPolicy().name().toLowerCase(Locale.ROOT));
+        if (!runtime.model().itemMigration().aliases().isEmpty()) {
+            CommentedConfig itemAliases = section(
+                    itemMigration, "aliases", "旧物品 ID 到当前物品 ID 的一对一别名。");
+            runtime.model().itemMigration().aliases().forEach(
+                    (source, target) -> itemAliases.set(source.toString(), target.toString()));
+        }
         CommentedConfig storage = section(root, "storage", "存储与缓存限制；修改后需要重启服务器。");
         storage.set("max_revisions", runtime.storage().maxRevisions());
         storage.set("cache_entries", runtime.storage().cacheEntries());
@@ -245,6 +301,77 @@ public final class ConfigManager {
             result.put("inventory_plus", ShareCatalog.STANDARD_ALIASES.get("inventory_plus"));
         }
         return result;
+    }
+
+    private static Map<ResourceLocation, ResourceLocation> parseResourceAliases(UnmodifiableConfig table) {
+        return parseResourceAliases(table, "advancement_migration.aliases");
+    }
+
+    private static Map<ResourceLocation, ResourceLocation> parseResourceAliases(
+            UnmodifiableConfig table, String path) {
+        if (table == null) return Map.of();
+        if (table.size() > MAX_MAP_ENTRIES) {
+            throw new IllegalArgumentException(path + " contains too many entries");
+        }
+        LinkedHashMap<ResourceLocation, ResourceLocation> result = new LinkedHashMap<>();
+        table.valueMap().forEach((source, rawTarget) -> {
+            if (source.equals("_documentation")) return;
+            ResourceLocation sourceId = resourceLocation(source, path + " source");
+            String target = requireString(rawTarget, path + "." + source);
+            if (target.isBlank()) {
+                throw new IllegalArgumentException(path + "." + source + " must not be blank");
+            }
+            ResourceLocation targetId = resourceLocation(target, path + "." + source);
+            if (result.put(sourceId, targetId) != null) {
+                throw new IllegalArgumentException("duplicate alias " + sourceId + " in " + path);
+            }
+        });
+        return Map.copyOf(result);
+    }
+
+    private static Map<ResourceLocation, Map<String, String>> parseCriterionAliases(UnmodifiableConfig table) {
+        if (table == null) return Map.of();
+        if (table.size() > MAX_MAP_ENTRIES) {
+            throw new IllegalArgumentException("advancement_migration.criterion_aliases contains too many entries");
+        }
+        LinkedHashMap<ResourceLocation, Map<String, String>> result = new LinkedHashMap<>();
+        table.valueMap().forEach((encodedAdvancement, rawMappings) -> {
+            if (encodedAdvancement.equals("_documentation")) return;
+            ResourceLocation advancement = resourceLocation(
+                    encodedAdvancement, "advancement_migration.criterion_aliases scope");
+            if (!(rawMappings instanceof UnmodifiableConfig mappings)) {
+                throw new IllegalArgumentException(
+                        "advancement_migration.criterion_aliases." + encodedAdvancement + " must be a table");
+            }
+            if (mappings.size() > MAX_MAP_ENTRIES) {
+                throw new IllegalArgumentException(
+                        "advancement_migration.criterion_aliases." + encodedAdvancement
+                                + " contains too many entries");
+            }
+            LinkedHashMap<String, String> scoped = new LinkedHashMap<>();
+            mappings.valueMap().forEach((source, rawTarget) -> {
+                if (source.equals("_documentation")) return;
+                String target = requireString(rawTarget,
+                        "advancement_migration.criterion_aliases." + encodedAdvancement + '.' + source);
+                if (source.isBlank()) {
+                    throw new IllegalArgumentException("criterion alias source must not be blank");
+                }
+                if (scoped.put(source, target) != null) {
+                    throw new IllegalArgumentException(
+                            "duplicate criterion alias " + encodedAdvancement + '/' + source);
+                }
+            });
+            result.put(advancement, Map.copyOf(scoped));
+        });
+        return Map.copyOf(result);
+    }
+
+    private static ResourceLocation resourceLocation(String value, String path) {
+        try {
+            return ResourceLocation.parse(value);
+        } catch (RuntimeException invalid) {
+            throw new IllegalArgumentException(path + " contains invalid resource location '" + value + "'", invalid);
+        }
     }
 
     private static List<WorldGroup> parseGroups(UnmodifiableConfig table, Object configuredOrder) {

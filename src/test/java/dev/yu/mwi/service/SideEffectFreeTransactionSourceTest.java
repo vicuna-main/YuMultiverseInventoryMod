@@ -26,7 +26,8 @@ class SideEffectFreeTransactionSourceTest {
         assertTrue(source.contains("AdvancementStateController.resumeListeners(player)"));
         assertTrue(source.contains("AdvancementStateController.resumeListenersAfterSuspend(player)"));
         assertTrue(service.contains("entry.getValue().equivalent(payload, live.get(entry.getValue()))"));
-        assertTrue(service.contains("move.adapter().equivalent(payload, before.get(move.adapter()))"));
+        assertTrue(service.contains(
+                "move.adapter().equivalent(payload, rollbackSnapshots.get(move.adapter()))"));
         assertTrue(source.contains("Always last: its reset packet"));
         assertTrue(source.contains("player.detectEquipmentUpdates()"));
 
@@ -81,10 +82,11 @@ class SideEffectFreeTransactionSourceTest {
         String liveState = Files.readString(LIVE_STATE);
 
         assertTrue(source.contains("entry.getValue().equivalent(payload, live.get(entry.getValue()))"));
-        assertTrue(source.contains("move.adapter().equivalent(payload, before.get(move.adapter()))"));
+        assertTrue(source.contains(
+                "move.adapter().equivalent(payload, rollbackSnapshots.get(move.adapter()))"));
         assertTrue(liveState.contains("entry.getKey().equivalent(entry.getValue(), current)"));
         assertFalse(source.contains("payload.equals(live.get(entry.getValue()))"));
-        assertFalse(source.contains("payload.equals(before.get(move.adapter()))"));
+        assertFalse(source.contains("payload.equals(rollbackSnapshots.get(move.adapter()))"));
     }
 
     @Test

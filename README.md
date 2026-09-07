@@ -8,7 +8,7 @@ NeoForge 1.21.1 服务端多世界玩家数据隔离模组。它模仿 Multivers
 
 - Minecraft 1.21.1
 - Java 21
-- 编译版本：NeoForge 21.1.235
+- 编译版本：NeoForge 21.1.244
 - 运行范围：NeoForge 21.1.x（最低 21.1.0）
 - Curios 9.5.1+1.21.1：可选软依赖
 
@@ -31,7 +31,7 @@ NeoForge 1.21.1 服务端多世界玩家数据隔离模组。它模仿 Multivers
 
 ## 安装
 
-将 `build/libs/yu_multiverse_inventory-1.0.0.jar` 放入服务端 `mods/`，然后启动一次生成：
+将 `build/libs/yu_multiverse_inventory-<version>.jar` 放入服务端 `mods/`，然后启动一次生成：
 
 ```text
 config/yu_multiverse_inventory.toml
@@ -46,6 +46,7 @@ data/mwi/profiles/<uuid>/<scope>/<scope-id>/<game-mode>/<share>.dat
 data/mwi/revisions/<uuid>/<revision>.dat
 data/mwi/transactions/<uuid>/<revision>.dat
 data/mwi/archives/conflicts/...
+data/mwi/archives/compatibility/...
 data/mwi/lost_found/...
 ```
 
@@ -104,6 +105,12 @@ on_profile_conflict = "prefer_current_world"
 archive_conflicts = true
 notify_admins = true
 
+[advancement_migration.aliases]
+# "trailandtales_delight:tat_delight" = "minecraft:trailandtales_delightmain/tat_delight"
+
+[advancement_migration.criterion_aliases."minecraft:trailandtales_delightmain/tat_delight"]
+# old_criterion = "trail_and_tales"
+
 [storage]
 max_revisions = 20
 cache_entries = 1024
@@ -125,6 +132,18 @@ data_directory = "plugins/Multiverse-Inventories"
 配置会完整解析和校验后才激活。修改 `storage` 后需重启；其他配置可用 `/mwi reload` 热加载，
 在线玩家按旧 profile key 到新 profile key 事务迁移。
 
+进度 ID 或 criterion 因数据包、模组安装/卸载、升级而消失时，只跳过当前注册表无法识别的部分；
+其他有效进度和其他 share 仍会正常恢复。被跳过的原始 payload 会先写入
+`archives/compatibility`，下一次 checkpoint 会保存清理后的当前注册表状态。ID 仍合法但已改名时，可在
+`advancement_migration` 中配置显式别名；目标必须存在于当前注册表。循环、空值和非法资源 ID 会使
+配置候选被拒绝，`/mwi reload` 会显示别名 dry-run 摘要。
+
+`bed_spawn` 保存的是维度 key，而不是“当前已加载世界”的引用。只要 NBT 字段及维度 ID 语法合法，
+按需世界当前未加载、`auto-load: false`，甚至之后已被永久删除，都不会阻断 profile 恢复或触发
+quarantine；MWI 不会为校验重生点而加载世界。玩家真正死亡重生时，目标不可用的处理继续交给
+Minecraft/服务端平台的原生回退语义。缺字段、错误 NBT 类型、空或非法维度 ID、NaN/Infinity
+角度仍会使当前 profile 事务严格失败并回滚。
+
 ## 命令
 
 所有命令默认需要权限等级 2：
@@ -133,14 +152,51 @@ data_directory = "plugins/Multiverse-Inventories"
 /mwi list
 /mwi info [world|group]
 /mwi reload
+/mwi status
 /mwi group create <name> <worlds-csv> <shares-csv>
 /mwi group add-worlds <name> <worlds-csv>
 /mwi group add-shares <name> <shares-csv>
 /mwi group remove-shares <name> <shares-csv>
 /mwi group check-conflicts
 /mwi cache stats
+/mwi cache invalidate player <uuid-or-known-name>
+/mwi repair player <uuid-or-known-name> bed-spawn --dry-run
+/mwi repair player <uuid-or-known-name> bed-spawn --clear <world:id|group:id|global:global|all>
+/mwi repair player <uuid-or-known-name> advancements --dry-run
+/mwi repair player <uuid-or-known-name> advancements --apply
+/mwi repair missing-items scan player <uuid-or-known-name> --dry-run
+/mwi repair missing-items apply player <uuid-or-known-name>
+/mwi repair missing-items scan all --dry-run
+/mwi repair missing-items apply all
+/mwi repair player <uuid-or-known-name> missing-items --dry-run
+/mwi repair player <uuid-or-known-name> missing-items --apply
+/mwi quarantine missing-items list <uuid-or-known-name>
+/mwi quarantine missing-items restore <uuid-or-known-name> <entry-id>
 /mwi recover <online-player> <revision>
 ```
+
+`repair ... --dry-run` 只读取并校验磁盘 profile，不修改文件、revision counter 或缓存；`--apply` 会先
+为每个修改项创建 compatibility archive，再通过原有 checksum 和原子批事务提交，最后清除该玩家的
+profile 缓存。离线玩家建议直接使用 UUID；名字只会从服务器已知的 profile cache 解析。
+
+`bed-spawn --dry-run` 会列出每个 canonical profile 的 scope、game mode、profile revision、维度 key、
+当前 loaded 状态和结构校验结果，不写磁盘、不分配 revision、也不改变缓存。`--clear` 只允许目标玩家
+离线时执行；它不会把 `loaded=false` 自动视为应清除项，必须由管理员显式指定 scope 或 `all`。
+实际清除会在同一可重放原子事务中归档原 profile、写入 `present=false`、更新 payload/envelope checksum
+和 revision journal，并清除该玩家的全部 profile cache key。
+
+从 1.0.4 升级后，先备份整个 `data/mwi/` 并替换 JAR。确认 1.0.5 已加载后，可撤销为规避登录故障
+而设置的 Multiverse `auto-load: true` 与 YuDefender permanent-world 配置，恢复按需卸载；随后在目标世界
+保持未加载的状态下验证玩家仍能登录。无需、也不建议为了升级而清除合法的 `bed_spawn`。
+
+缺失物品修复覆盖主背包、盔甲、副手、末影箱、Curios 功能/外观槽、Cosmetic Armor 和
+TrashSlot。只有能够从原始 NBT 明确证明 item 或 data component registry key 已不存在时才会
+隔离单个 stack；格式、槽位、数量、codec、checksum 或 envelope 损坏仍严格失败。隔离前的原始
+stack 会随完整 source profile 原子写入
+`data/mwi/archives/compatibility/missing_items/<uuid>/`。restore 会重新验证 registry/component，且
+目标槽非空时拒绝覆盖。
+`all` 使用最多 32 名玩家、约 100ms 的有界轮转批次；输出 `truncated=true` 时重复同一命令即可从
+下一批继续，避免一次命令长期占用 server thread。
 
 命令中的世界参数支持完整维度 ID、`/`、大小写旧世界名以及逗号分隔的世界选择器；名称包含空格时
 使用引号，例如 `"Legacy World/Mining Zone"`。`info`、`group create` 和 `group add-worlds`
@@ -203,6 +259,46 @@ MVInv 5.3.5 的档案格式只包含背包、末影箱、盔甲和副手，不�
 `recover` 恢复指定 revision 的事务前快照，并立即写入一个新 revision。配置冲突、NBT 损坏、
 缺失严格 mod 槽适配器或任一 apply 失败时，玩家旧 live 状态会回滚；为避免继续产生不一致，
 服务器会断开该玩家并保留诊断数据。
+
+### 从 1.0.2 升级到 1.0.3
+
+停服备份 `data/mwi/` 后替换 JAR。1.0.3 修复两类数据安全问题：
+
+- 登录阶段的 vanilla live state 不再因为 `clean_shutdown=false` 被当作当前 group/world 的权威档案。
+  已存在的 canonical profile 始终优先；只有某个 share 从未存在过任何 MWI profile 时，才允许用未知来源的
+  login live state 做首次 bootstrap。混合端 pre-login 传送也会先恢复事件 source scope 的 canonical state，
+  避免把上一次 session 的 playerdata 写进 lobby/default 等其他组。
+- hunger/health/xp 等 scalar payload 的 capture/apply 契约已对齐。合法的 modded saturation（例如 `20.6`）
+  不再被 vanilla `[0,20]` 上限误判为损坏；`NaN`/Infinity、负值和明显异常值仍然拒绝。旧 1.0.2
+  hunger profile 无需批量改 checksum，升级后可直接读取。
+
+1.0.3 的 prepared login revision 另外保存真实 `canonical_before`，崩溃恢复时不会再把未知 login live
+快照写回 canonical target。旧格式 revision 仍保持可读。
+
+无别名时，合法但已过期的进度或 criterion 会在加载时归档并跳过；需要保留改名后的进度时，先配置
+alias，执行 `/mwi reload`，再对受影响玩家运行 repair dry-run 和 apply。真正的 NBT 类型错误、非法 ID/
+时间、重复原生条目或 checksum 错误仍会严格失败，不会被兼容模式掩盖。
+
+物品注册表漂移默认使用 `item_migration.missing_item_policy = "quarantine_and_continue"`：坏 stack
+原位变为空槽，其他槽不移动并继续恢复。需要旧行为时可改为 `strict_fail`。确定性改名可配置：
+
+```toml
+[item_migration]
+missing_item_policy = "quarantine_and_continue"
+
+[item_migration.aliases]
+"oldmod:old_item" = "newmod:new_item"
+```
+
+alias 目标必须存在且完整 stack 能由当前 codec 接受，否则仍进入 quarantine；非法 ID、空值和循环
+会使 `/mwi reload` 拒绝候选配置。
+
+### 从 1.0.3 升级到 1.0.4
+
+1.0.4 将 hunger exhaustion 的单字段数值异常改为可恢复错误。负数、NaN/Infinity 或超过安全上限的值
+会被归一化为 `0`，同时写回玩家实时 `FoodData` 并输出包含玩家、处理阶段、原因、原值和修复值的 WARN。
+MWI 会继续当前登录、保存或世界切换事务，不再因为这一项隔离或踢出玩家；缺失字段、错误 NBT 类型及
+其他结构性损坏仍保持严格失败。
 
 ## 构建与验证
 

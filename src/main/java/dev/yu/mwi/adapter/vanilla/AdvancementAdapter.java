@@ -1,6 +1,7 @@
 package dev.yu.mwi.adapter.vanilla;
 
 import dev.yu.mwi.api.AdapterIds;
+import dev.yu.mwi.config.MwiConfig;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
@@ -95,9 +96,10 @@ public final class AdvancementAdapter extends AbstractVanillaAdapter {
 
     @Override
     public void apply(ServerPlayer player, CompoundTag data, HolderLookup.Provider lookup) {
-        NbtPayload.requireData(data, id().toString());
+        AdvancementPreparation preparation = prepare(
+                player.server.getAdvancements(), data, MwiConfig.AdvancementMigration.defaults());
         Map<AdvancementHolder, List<CompletedCriterion>> decoded =
-                decode(player.server.getAdvancements(), data);
+                decode(player.server.getAdvancements(), preparation.payload());
         PlayerAdvancements advancements = player.getAdvancements();
         for (Map.Entry<AdvancementHolder, List<CompletedCriterion>> entry : decoded.entrySet()) {
             AdvancementHolder holder = entry.getKey();
@@ -116,6 +118,17 @@ public final class AdvancementAdapter extends AbstractVanillaAdapter {
                 progress.criteria.put(criterion.name(), new CriterionProgress(criterion.obtained()));
             }
         }
+    }
+
+    /** Validates and normalizes a stored profile without mutating live player advancement state. */
+    public AdvancementPreparation prepare(
+            ServerAdvancementManager manager,
+            CompoundTag data,
+            MwiConfig.AdvancementMigration migration) {
+        return AdvancementPayloadMigrator.prepare(data, migration, advancementId -> {
+            AdvancementHolder holder = manager.get(advancementId);
+            return holder == null ? null : Set.copyOf(holder.value().criteria().keySet());
+        });
     }
 
     @Override

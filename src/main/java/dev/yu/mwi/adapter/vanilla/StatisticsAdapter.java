@@ -4,6 +4,7 @@ import dev.yu.mwi.api.AdapterIds;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -15,9 +16,12 @@ import net.minecraft.stats.ServerStatsCounter;
 import net.minecraft.stats.Stat;
 import net.minecraft.stats.StatType;
 import it.unimi.dsi.fastutil.objects.Object2IntMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Captures every non-zero statistic across all registered vanilla and modded stat types. */
 public final class StatisticsAdapter extends AbstractVanillaAdapter {
+    private static final Logger LOGGER = LoggerFactory.getLogger(StatisticsAdapter.class);
     private static final String STATISTICS = "statistics";
     private static final String TYPE = "type";
     private static final String VALUE = "value";
@@ -115,7 +119,11 @@ public final class StatisticsAdapter extends AbstractVanillaAdapter {
         }
     }
 
-    private List<DecodedStatistic> decode(CompoundTag data) {
+    List<DecodedStatistic> decode(CompoundTag data) {
+        return decode(data, this::resolveRegisteredStat);
+    }
+
+    List<DecodedStatistic> decode(CompoundTag data, StatisticResolver resolver) {
         ListTag entries = NbtPayload.requireCompoundList(data, STATISTICS, id().toString());
         List<DecodedStatistic> decoded = new ArrayList<>(entries.size());
         Set<String> seen = new HashSet<>();
@@ -126,25 +134,37 @@ public final class StatisticsAdapter extends AbstractVanillaAdapter {
             ResourceLocation valueId = parseId(
                     NbtPayload.requireString(entry, VALUE, id().toString()), "statistic value");
             int count = NbtPayload.requireInt(entry, COUNT, id().toString());
-            if (count <= 0) {
-                throw NbtPayload.invalid(id().toString(), "statistic counts must be positive");
+            if (count == 0) {
+                throw NbtPayload.invalid(id().toString(), "statistic counts must be non-zero");
             }
             String key = typeId + "\u0000" + valueId;
             if (!seen.add(key)) {
                 throw NbtPayload.invalid(id().toString(), "duplicate statistic " + typeId + '/' + valueId);
             }
-            StatType<?> type = BuiltInRegistries.STAT_TYPE.getOptional(typeId)
-                    .orElseThrow(() -> NbtPayload.invalid(id().toString(), "unknown statistic type " + typeId));
-            decoded.add(new DecodedStatistic(resolveStat(type, valueId), count, typeId, valueId));
+            Optional<Stat<?>> stat = resolver.resolve(typeId, valueId);
+            if (stat.isEmpty()) {
+                warnUnavailable(typeId, valueId);
+                continue;
+            }
+            decoded.add(new DecodedStatistic(stat.orElseThrow(), count, typeId, valueId));
         }
         return decoded;
     }
 
-    private <T> Stat<T> resolveStat(StatType<T> type, ResourceLocation valueId) {
-        T value = type.getRegistry().getOptional(valueId)
-                .orElseThrow(() -> NbtPayload.invalid(id().toString(),
-                        "unknown statistic value " + valueId));
-        return type.get(value);
+    private Optional<Stat<?>> resolveRegisteredStat(ResourceLocation typeId, ResourceLocation valueId) {
+        return BuiltInRegistries.STAT_TYPE.getOptional(typeId)
+                .flatMap(type -> resolveStat(type, valueId));
+    }
+
+    private <T> Optional<Stat<?>> resolveStat(StatType<T> type, ResourceLocation valueId) {
+        return type.getRegistry().getOptional(valueId).map(type::get);
+    }
+
+    private void warnUnavailable(ResourceLocation typeId, ResourceLocation valueId) {
+        LOGGER.warn(
+                "Ignoring unavailable stored statistic {}/{}; its registry entry is not present in the current mod set",
+                typeId,
+                valueId);
     }
 
     private ResourceLocation parseId(String encoded, String field) {
@@ -160,5 +180,10 @@ public final class StatisticsAdapter extends AbstractVanillaAdapter {
     }
 
     private record EncodedStatistic(ResourceLocation typeId, ResourceLocation valueId, int count) {
+    }
+
+    @FunctionalInterface
+    interface StatisticResolver {
+        Optional<Stat<?>> resolve(ResourceLocation typeId, ResourceLocation valueId);
     }
 }
