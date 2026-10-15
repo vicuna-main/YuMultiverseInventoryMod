@@ -97,6 +97,7 @@ final class ProfileSnapshotWriter implements AutoCloseable {
         if (asynchronous) {
             enqueue(player.getUUID(), revision, writes, Optional.empty(), reason);
         } else {
+            queue.flush(player.getUUID());
             store.commitBatch(player.getUUID(), revision, writes, Optional.empty());
             remember(player.getUUID(), revision, writes);
             logger.debug("Persisted {} inventory profile for {} at revision {}",
@@ -118,6 +119,7 @@ final class ProfileSnapshotWriter implements AutoCloseable {
             long revision,
             Map<ProfileKey, CompoundTag> writes,
             Optional<CompoundTag> completedJournal) throws IOException {
+        queue.flush(playerId);
         store.commitBatch(playerId, revision, writes, completedJournal);
         remember(playerId, revision, writes);
     }
@@ -128,6 +130,7 @@ final class ProfileSnapshotWriter implements AutoCloseable {
             Map<ProfileKey, CompoundTag> writes,
             Optional<CompoundTag> completedJournal,
             java.util.List<ProfileArchive> archives) throws IOException {
+        queue.flush(playerId);
         store.commitBatch(playerId, revision, writes, completedJournal, archives);
         remember(playerId, revision, writes);
     }
@@ -195,8 +198,9 @@ final class ProfileSnapshotWriter implements AutoCloseable {
         Map<ProfileKey, StoredProfile> profiles = workingSets.computeIfAbsent(
                 playerId, ignored -> new ConcurrentHashMap<>());
         Instant capturedAt = Instant.now();
-        writes.forEach((key, payload) -> profiles.put(
-                key, new StoredProfile(payload, revision, capturedAt, "pending:" + revision)));
+        writes.forEach((key, payload) -> profiles.compute(key, (ignored, old) ->
+                old != null && old.revision() > revision ? old
+                        : new StoredProfile(payload, revision, capturedAt, "pending:" + revision)));
     }
 
     void refreshWorkingSetIfLoaded(

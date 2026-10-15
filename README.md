@@ -9,7 +9,7 @@ NeoForge 1.21.1 服务端多世界玩家数据隔离模组。它模仿 Multivers
 - Minecraft 1.21.1
 - Java 21
 - 编译版本：NeoForge 21.1.244
-- 运行范围：NeoForge 21.1.x（最低 21.1.0）
+- 运行范围：NeoForge 21.1.x（最低 21.1.244）
 - Curios 9.5.1+1.21.1：可选软依赖
 
 该模组不注册物品、方块或网络 payload，客户端无需安装。
@@ -28,6 +28,7 @@ NeoForge 1.21.1 服务端多世界玩家数据隔离模组。它模仿 Multivers
 - 配置合组冲突默认采用当前世界 profile，并归档其他旧 profile，避免静默合并造成复制。
 - NeoForge 维度事件为主，轻量玩家 tick 仅比较维度/游戏模式作为混合端漏事件兜底。
 - 混合端在安全的 NeoForge 登录边界初始化；退出在 Bukkit Quit 后做最终保存。
+- 1.2.0 提供服务端[背包恢复中心](docs/recovery-center.md)：与 TombStoneDefender 1.5.0 通过 V2 先封存墓碑再提交物品；无关墓碑不遮住独立来源，领取条件单独展示，提醒有持久回执。
 
 ## 安装
 
@@ -45,6 +46,8 @@ data/mwi/revision_counters/<uuid>.dat
 data/mwi/profiles/<uuid>/<scope>/<scope-id>/<game-mode>/<share>.dat
 data/mwi/revisions/<uuid>/<revision>.dat
 data/mwi/transactions/<uuid>/<revision>.dat
+data/mwi/recovery_sources/<uuid>/<source>.dat
+data/mwi/recovery_operations/<uuid>/<operation>.dat
 data/mwi/archives/conflicts/...
 data/mwi/archives/compatibility/...
 data/mwi/lost_found/...
@@ -193,7 +196,7 @@ profile 缓存。离线玩家建议直接使用 UUID；名字只会从服务器�
 TrashSlot。只有能够从原始 NBT 明确证明 item 或 data component registry key 已不存在时才会
 隔离单个 stack；格式、槽位、数量、codec、checksum 或 envelope 损坏仍严格失败。隔离前的原始
 stack 会随完整 source profile 原子写入
-`data/mwi/archives/compatibility/missing_items/<uuid>/`。restore 会重新验证 registry/component，且
+`data/mwi/archives/compatibility/missing_items/<uuid>/`。restore 会重新验证 registry/component，并在
 目标槽非空时拒绝覆盖。
 `all` 使用最多 32 名玩家、约 100ms 的有界轮转批次；输出 `truncated=true` 时重复同一命令即可从
 下一批继续，避免一次命令长期占用 server thread。
@@ -256,9 +259,9 @@ MVInv 5.3.5 的档案格式只包含背包、末影箱、盔甲和副手，不�
 `/mvinvopen curios|trash|fashion <online-player> [world] [page]`（等同对应 `/inv` 编辑器）
 恢复本模组已经接管的档案。
 
-`recover` 恢复指定 revision 的事务前快照，并立即写入一个新 revision。配置冲突、NBT 损坏、
-缺失严格 mod 槽适配器或任一 apply 失败时，玩家旧 live 状态会回滚；为避免继续产生不一致，
-服务器会断开该玩家并保留诊断数据。
+从 1.1.0 起，`recover` 仅阻止已有恢复来源的同一玩家、同一物品 share 范围的历史回滚，以免绕过领取凭证；
+普通墓碑存档凭证及其他玩家/范围不受影响。来源物品恢复使用 `/mwirecovery`。原有恢复仍会写入新 revision，
+配置冲突、NBT 损坏或 apply 失败时回滚、断开玩家并保留诊断数据。
 
 ### 从 1.0.2 升级到 1.0.3
 

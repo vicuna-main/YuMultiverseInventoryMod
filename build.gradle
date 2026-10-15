@@ -26,6 +26,7 @@ sourceSets.main.resources {
 }
 
 repositories {
+    mavenCentral()
     maven {
         name = 'Curios'
         url = 'https://maven.theillusivec4.top'

@@ -152,7 +152,7 @@ class PreLoginDimensionTransitionSourceTest {
     }
 
     private static String reconcileSource() throws Exception {
-        String source = Files.readString(SERVICE);
+        String source = Files.readString(SERVICE).replace("\r\n", "\n");
         int reconcileStart = source.indexOf(
                 "private void reconcile(\n            ServerPlayer player,\n            ResourceKey<Level> targetDimension");
         int migrationStart = source.indexOf("private CompoundTag migrateGroupTarget", reconcileStart);

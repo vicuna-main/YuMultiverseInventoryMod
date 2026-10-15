@@ -86,6 +86,7 @@ public final class MwiServerController {
         configManager = candidateManager;
         adapters = candidateAdapters;
         service = candidateService;
+        dev.yu.mwi.api.RecoveryBridgeV1.register(startingServer, service.recoveryCenter());
         pendingLogouts.clear();
         logger.info("Yu Multiverse Inventory started with {} adapters and {} world groups",
                 candidateAdapters.size(), config.model().groups().size());
@@ -101,6 +102,7 @@ public final class MwiServerController {
         try {
             service.close();
         } finally {
+            dev.yu.mwi.api.RecoveryBridgeV1.unregister(stoppingServer);
             pendingLogouts.clear();
             service = null;
             adapters = null;
@@ -131,6 +133,10 @@ public final class MwiServerController {
 
     public void respawned(ServerPlayer player) throws TransitionException {
         requireService(player.server).respawned(player);
+    }
+
+    public void invalidateRecoveryConfirmation(ServerPlayer player) {
+        if (service != null && server == player.server) service.invalidateRecoveryConfirmation(player);
     }
 
     /** Defers logout persistence until SaveToFile, after hybrid-server quit handlers have run. */

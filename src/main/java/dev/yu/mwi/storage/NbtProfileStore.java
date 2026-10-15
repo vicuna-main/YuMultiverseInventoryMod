@@ -51,6 +51,7 @@ public final class NbtProfileStore implements ProfileStore {
     private final FaultInjector faultInjector;
     private final Map<UUID, RevisionState> revisionStates = new ConcurrentHashMap<>();
     private final Map<UUID, ProfileCorruptionException> blockedPlayers = new ConcurrentHashMap<>();
+    private final Map<UUID, Path> pendingPlayers = new ConcurrentHashMap<>();
     private final Map<UUID, ReentrantLock> persistenceLocks = new ConcurrentHashMap<>();
     private final Map<UUID, java.util.Set<ProfileKey>> startupResetTargets = new ConcurrentHashMap<>();
     private final java.util.Set<UUID> canonicalRecoveryPlayers = ConcurrentHashMap.newKeySet();
@@ -204,6 +205,7 @@ public final class NbtProfileStore implements ProfileStore {
     }
 
     private SaveResult saveLocked(ProfileKey key, CompoundTag payload, long revision) throws IOException {
+        requireNoPendingWrites(key.playerId());
         if (revision < 1) {
             throw new IllegalArgumentException("revision must be positive");
         }
@@ -232,7 +234,7 @@ public final class NbtProfileStore implements ProfileStore {
             Optional<CompoundTag> completedJournal) throws IOException {
         ReentrantLock lock = acquirePersistenceLock(playerId);
         try {
-            commitBatchLocked(playerId, revision, profiles, completedJournal, List.of());
+            commitBatchLocked(playerId, revision, profiles, completedJournal, List.of(), Optional.empty());
         } finally {
             lock.unlock();
         }
@@ -247,7 +249,7 @@ public final class NbtProfileStore implements ProfileStore {
             List<ProfileArchive> archives) throws IOException {
         ReentrantLock lock = acquirePersistenceLock(playerId);
         try {
-            commitBatchLocked(playerId, revision, profiles, completedJournal, List.copyOf(archives));
+            commitBatchLocked(playerId, revision, profiles, completedJournal, List.copyOf(archives), Optional.empty());
         } finally {
             lock.unlock();
         }
@@ -258,10 +260,14 @@ public final class NbtProfileStore implements ProfileStore {
             long revision,
             Map<ProfileKey, CompoundTag> profiles,
             Optional<CompoundTag> completedJournal,
-            List<ProfileArchive> archives) throws IOException {
+            List<ProfileArchive> archives, Optional<RecoveryMutation> recovery) throws IOException {
+        requireNoPendingWrites(playerId);
         if (revision < 1) {
             throw new IllegalArgumentException("revision must be positive");
         }
+        requireHealthyPlayer(playerId);
+        Optional<CompoundTag> recoveryWrite = recovery.isPresent()
+                ? Optional.of(prepareRecovery(playerId, revision, recovery.orElseThrow())) : Optional.empty();
         ListTag writes = new ListTag();
         Instant savedAt = Instant.now();
         for (Map.Entry<ProfileKey, CompoundTag> entry : profiles.entrySet()) {
@@ -292,8 +298,8 @@ public final class NbtProfileStore implements ProfileStore {
             write.putLong("canonical_bytes", digest.canonicalBytes());
             writes.add(write);
         }
-        ListTag archiveWrites = prepareArchiveWrites(playerId, revision, archives);
-        if (writes.isEmpty() && archiveWrites.isEmpty()) {
+        ListTag archiveWrites = prepareArchiveWrites(playerId, revision, archives, profiles);
+        if (writes.isEmpty() && archiveWrites.isEmpty() && recoveryWrite.isEmpty()) {
             if (completedJournal.isPresent()) {
                 writeRevision(playerId, revision, completedJournal.orElseThrow());
             }
@@ -309,20 +315,27 @@ public final class NbtProfileStore implements ProfileStore {
             transaction.put("archives", archiveWrites);
         }
         completedJournal.ifPresent(journal -> transaction.put("journal", journal.copy()));
+        recoveryWrite.ifPresent(document -> transaction.put("recovery", document));
         addTransactionChecksum(transaction);
         Path transactionFile = transactionPath(playerId, revision);
-        AtomicNbtFile.write(transactionFile, transaction, faultInjector);
+        boolean walWritten = false;
         try {
+            AtomicNbtFile.write(transactionFile, transaction, faultInjector);
+            walWritten = true;
             faultInjector.transactionDurable(transactionFile);
             applyPendingTransaction(transactionFile, transaction, true);
-        } catch (IOException failure) {
-            cleanCloseAllowed.set(false);
-            throw new PendingTransactionException(transactionFile, failure);
+        } catch (IOException | RuntimeException failure) {
+            if (walWritten || Files.exists(transactionFile)) {
+                cleanCloseAllowed.set(false);
+                pendingPlayers.put(playerId, transactionFile);
+                throw new PendingTransactionException(transactionFile, failure);
+            }
+            throw failure;
         }
     }
 
     private ListTag prepareArchiveWrites(
-            UUID playerId, long revision, List<ProfileArchive> archives) throws IOException {
+            UUID playerId, long revision, List<ProfileArchive> archives, Map<ProfileKey, CompoundTag> profiles) throws IOException {
         ListTag writes = new ListTag();
         java.util.Set<String> destinations = new HashSet<>();
         for (ProfileArchive request : archives) {
@@ -340,8 +353,7 @@ public final class NbtProfileStore implements ProfileStore {
             CompoundTag write = new CompoundTag();
             write.put("key", encodeKey(key));
             write.putString("category", category);
-            write.put("document", archiveDocument(
-                    key, category, request.reason(), revision, source, request.details()));
+            write.put("document", archiveDocument(key, category, request.reason(), revision, source, request.details()));
             writes.add(write);
         }
         return writes;
@@ -813,6 +825,9 @@ public final class NbtProfileStore implements ProfileStore {
         if (transaction.contains("journal", Tag.TAG_COMPOUND)) {
             view.put("journal", transaction.getCompound("journal"));
         }
+        if (transaction.contains("recovery")) {
+            view.put("recovery", transaction.get("recovery"));
+        }
         return view;
     }
 
@@ -915,6 +930,9 @@ public final class NbtProfileStore implements ProfileStore {
                 || transaction.getLong("revision") < 1
                 || !transaction.contains("profiles", Tag.TAG_LIST)) {
             throw new ProfileCorruptionException(file, "Pending transaction metadata is invalid");
+        }
+        if (transaction.contains("recovery")) {
+            verifyRecovery(file, transaction.getCompound("recovery"), transaction.getUUID("player_uuid"), transaction.getLong("revision"));
         }
         if (TRANSACTION_ALGORITHM.equals(transaction.getString("transaction_checksum_algorithm"))) {
             String expected = transaction.getString("transaction_checksum");
@@ -1048,7 +1066,159 @@ public final class NbtProfileStore implements ProfileStore {
             writeRevisionLocked(playerId, revision, transaction.getCompound("journal"));
         }
         advanceRevisionCounter(playerId, revision);
+        if (transaction.contains("recovery")) {
+            applyRecovery(transactionFile, transaction.getCompound("recovery"), playerId, revision);
+        }
         AtomicNbtFile.deleteDurably(transactionFile);
+    }
+
+    @Override
+    public void commitRecovery(UUID playerId, long revision, Map<ProfileKey, CompoundTag> profiles,
+                               RecoveryMutation mutation) throws IOException {
+        ReentrantLock lock = acquirePersistenceLock(playerId);
+        try {
+            commitBatchLocked(playerId, revision, profiles, Optional.empty(), List.of(), Optional.of(mutation));
+        } finally { lock.unlock(); }
+    }
+
+    @Override
+    public Optional<StoredRecovery> loadRecovery(UUID playerId, UUID sourceId) throws IOException {
+        ReentrantLock lock = acquirePersistenceLock(playerId);
+        try {
+            requireHealthyPlayer(playerId);
+            Path path = recoveryPath("recovery_sources", playerId, sourceId);
+            if (!Files.exists(path)) return Optional.empty();
+            CompoundTag document = readRecovery(path, playerId);
+            if (!sourceId.equals(document.getUUID("source_id"))) throw new IOException("Recovery source identity mismatch");
+            return Optional.of(new StoredRecovery(sourceId, document.getLong("version"),
+                    document.getUUID("operation_id"), document.getLong("revision"),
+                    document.getCompound("payload"), document.getString("recovery_checksum")));
+        } finally { lock.unlock(); }
+    }
+
+    @Override
+    public List<StoredRecovery> listRecoveries(UUID playerId) throws IOException {
+        Path directory = root.resolve("recovery_sources").resolve(playerId.toString());
+        if (!Files.isDirectory(directory)) return List.of();
+        List<StoredRecovery> result = new ArrayList<>();
+        try (var files = Files.newDirectoryStream(directory, "*.dat")) {
+            for (Path path : files) {
+                String name = path.getFileName().toString();
+                UUID id = parseUuid(name.substring(0, name.length() - 4))
+                        .orElseThrow(() -> new IOException("Invalid recovery source filename"));
+                if (result.size() >= 4096) throw new IOException("Recovery source listing exceeds safety limit");
+                try {
+                    StoredRecovery record = loadRecovery(playerId, id).orElseThrow();
+                    CompoundTag summary = new CompoundTag();
+                    summary.putString("state", record.payload().getString("state"));
+                    summary.putLong("created_at", record.payload().getLong("created_at"));
+                    result.add(new StoredRecovery(id, record.version(), record.operationId(), record.profileRevision(), summary, record.checksum()));
+                } catch (IOException failure) {
+                    LOGGER.error("Recovery source {} is isolated; other cases remain available", path, failure);
+                    CompoundTag summary = new CompoundTag(); summary.putString("state", "REVIEW");
+                    summary.putString("error", "原件损坏或无法校验，禁止自动恢复");
+                    result.add(new StoredRecovery(id, -1, id, 0, summary, ""));
+                }
+            }
+        }
+        result.sort(Comparator.comparingLong(StoredRecovery::profileRevision).reversed());
+        return List.copyOf(result);
+    }
+
+    @Override
+    public Optional<CompoundTag> recoveryOperation(UUID playerId, UUID operationId) throws IOException {
+        ReentrantLock lock = acquirePersistenceLock(playerId);
+        try {
+            requireHealthyPlayer(playerId);
+            Path path = recoveryPath("recovery_operations", playerId, operationId);
+            if (!Files.exists(path)) return Optional.empty();
+            CompoundTag document = readRecovery(path, playerId);
+            if (!operationId.equals(document.getUUID("operation_id"))) throw new IOException("Recovery operation identity mismatch");
+            return Optional.of(document.copy());
+        } finally { lock.unlock(); }
+    }
+
+    private CompoundTag prepareRecovery(UUID playerId, long revision, RecoveryMutation mutation) throws IOException {
+        requireNoPendingWrites(playerId);
+        if (recoveryOperation(playerId, mutation.operationId()).isPresent()) {
+            throw new IOException("Recovery operation already committed; query its receipt, do not reissue");
+        }
+        Optional<StoredRecovery> current = loadRecovery(playerId, mutation.sourceId());
+        if (current.map(StoredRecovery::version).orElse(-1L) != mutation.expectedVersion()) {
+            throw new IOException("Recovery source changed; reopen the preview");
+        }
+        CompoundTag payload = mutation.payload();
+        if (!payload.contains("identity", Tag.TAG_COMPOUND)
+                || !java.util.Set.of("REVIEW", "AVAILABLE", "CLOSED").contains(payload.getString("state"))) {
+            throw new IOException("Invalid recovery payload");
+        }
+        requireProfileSize(NbtChecksums.canonicalDigest(payload).canonicalBytes());
+        if (current.isPresent()) {
+            CompoundTag before = current.orElseThrow().payload();
+            if (!before.getCompound("identity").equals(payload.getCompound("identity"))) {
+                throw new IOException("Recovery evidence and scope are immutable");
+            }
+            if ("CLOSED".equals(before.getString("state"))) throw new IOException("Recovery source is permanently closed");
+        }
+        CompoundTag document = new CompoundTag();
+        document.putInt("schema_version", 1);
+        document.putUUID("player_uuid", playerId);
+        document.putUUID("source_id", mutation.sourceId());
+        document.putUUID("operation_id", mutation.operationId());
+        document.putLong("version", Math.addExact(mutation.expectedVersion(), 1));
+        document.putLong("revision", revision);
+        document.put("payload", payload);
+        addDocumentChecksum(document, "recovery");
+        return document;
+    }
+
+    private Path recoveryPath(String category, UUID playerId, UUID id) {
+        return root.resolve(category).resolve(playerId.toString()).resolve(id + ".dat");
+    }
+
+    private CompoundTag readRecovery(Path path, UUID owner) throws IOException {
+        if (Files.isSymbolicLink(path)) throw new IOException("Recovery record cannot be a symbolic link");
+        CompoundTag document = AtomicNbtFile.read(path);
+        verifyRecovery(path, document, owner, document.getLong("revision"));
+        return document;
+    }
+
+    private static void verifyRecovery(Path path, CompoundTag document, UUID owner, long revision) throws IOException {
+        if (document.getInt("schema_version") != 1 || !document.hasUUID("player_uuid")
+                || !owner.equals(document.getUUID("player_uuid")) || !document.hasUUID("source_id")
+                || !document.hasUUID("operation_id") || !document.contains("version", Tag.TAG_LONG)
+                || document.getLong("version") < 0 || document.getLong("revision") != revision || revision < 1
+                || !document.contains("payload", Tag.TAG_COMPOUND)
+                || !DOCUMENT_ALGORITHM.equals(document.getString("recovery_checksum_algorithm"))) {
+            throw new ProfileCorruptionException(path, "Invalid recovery record envelope");
+        }
+        // Unlike old profile journals, recovery evidence is never migrated from unchecked data.
+        String expected = document.getString("recovery_checksum");
+        CompoundTag checked = document.copy(); checked.remove("recovery_checksum");
+        if (!expected.equals(NbtChecksums.canonicalSha256(checked))) {
+            throw new ProfileCorruptionException(path, "Recovery checksum mismatch");
+        }
+    }
+
+    private void applyRecovery(Path transactionPath, CompoundTag document, UUID playerId, long revision) throws IOException {
+        verifyRecovery(transactionPath, document, playerId, revision);
+        UUID sourceId = document.getUUID("source_id"), operationId = document.getUUID("operation_id");
+        Path sourcePath = recoveryPath("recovery_sources", playerId, sourceId);
+        Path operationPath = recoveryPath("recovery_operations", playerId, operationId);
+        if (Files.exists(operationPath)) {
+            if (!readRecovery(operationPath, playerId).equals(document)) throw new IOException("Recovery operation collision");
+        } else AtomicNbtFile.write(operationPath, document, faultInjector);
+        if (Files.exists(sourcePath)) {
+            CompoundTag installed = readRecovery(sourcePath, playerId);
+            long installedVersion = installed.getLong("version"), version = document.getLong("version");
+            if (installedVersion > version) return; // Later committed progress is authoritative.
+            if (installedVersion == version) {
+                if (!installed.equals(document)) throw new IOException("Recovery source version collision");
+                return;
+            }
+            if (installedVersion + 1 != version) throw new IOException("Recovery source history gap");
+        } else if (document.getLong("version") != 0) throw new IOException("Missing recovery source history");
+        AtomicNbtFile.write(sourcePath, document, faultInjector);
     }
 
     private boolean recoverOrphanedPreparedRevisions() throws IOException {
@@ -1415,6 +1585,11 @@ public final class NbtProfileStore implements ProfileStore {
         if (failure != null) {
             throw failure;
         }
+    }
+
+    private void requireNoPendingWrites(UUID playerId) throws ProfileCorruptionException {
+        Path pending = pendingPlayers.get(playerId);
+        if (pending != null) throw new ProfileCorruptionException(pending, "A durable transaction requires restart recovery");
     }
 
     private void loadQuarantineMarkers() throws IOException {

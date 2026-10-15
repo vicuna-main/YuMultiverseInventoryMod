@@ -73,6 +73,11 @@ public final class InventoryIsolationService implements AutoCloseable {
     private final ProfileSnapshotWriter snapshotWriter;
     private final ProfileMigrationService migrationService;
     private final RevisionRecoveryService recoveryService;
+    private final dev.yu.mwi.recovery.RecoveryCenter recoveryCenter;
+    private final Set<UUID> recoveryCheckpoints = new java.util.HashSet<>();
+    private final Map<UUID, RecoverySessionToken> recoverySessionTokens = new HashMap<>();
+    private long nextRecoverySessionToken;
+    private record RecoverySessionToken(Session session, long token) {}
     private final Map<UUID, Session> sessions = new ConcurrentHashMap<>();
     private final Map<UUID, ReentrantLock> playerLocks = new ConcurrentHashMap<>();
     private final Set<UUID> activeTransactions = ConcurrentHashMap.newKeySet();
@@ -107,6 +112,117 @@ public final class InventoryIsolationService implements AutoCloseable {
         this.migrationService = new ProfileMigrationService(server, snapshotWriter, logger);
         this.recoveryService = new RevisionRecoveryService(store);
         this.state = State.create(config, adapters, 1L);
+        this.recoveryCenter = new dev.yu.mwi.recovery.RecoveryCenter(store,
+                new dev.yu.mwi.recovery.RecoveryCenter.Host() {
+                    @Override public void awaitPendingWrites(UUID owner) throws IOException {
+                        requireServerThread();
+                        snapshotWriter.flush(owner);
+                    }
+                    @Override public String sessionToken(ServerPlayer player) throws IOException {
+                        try {
+                            Session session = requireRecoverySession(player);
+                            RecoverySessionToken token = recoverySessionTokens.get(player.getUUID());
+                            if (token == null || token.session() != session) {
+                                token = new RecoverySessionToken(session, Math.incrementExact(nextRecoverySessionToken));
+                                nextRecoverySessionToken = token.token(); recoverySessionTokens.put(player.getUUID(), token);
+                            }
+                            return Long.toString(token.token());
+                        } catch (TransitionException failure) { throw new IOException(failure.getMessage(), failure); }
+                    }
+                    @Override public CompoundTag scope(ServerPlayer player) throws IOException {
+                        try { return recoveryScope(requireRecoverySession(player)); }
+                        catch (TransitionException failure) { throw new IOException(failure.getMessage(), failure); }
+                    }
+                    @Override public void commit(ServerPlayer player, CompoundTag scope,
+                            Optional<CompoundTag> expectedInventory, Optional<CompoundTag> inventory,
+                            dev.yu.mwi.storage.RecoveryMutation mutation) throws IOException {
+                        commitRecovery(player, scope, expectedInventory, inventory, mutation);
+                    }
+                });
+    }
+
+    public dev.yu.mwi.recovery.RecoveryCenter recoveryCenter() { return recoveryCenter; }
+
+    public void invalidateRecoveryConfirmation(ServerPlayer player) {
+        requireServerThread();
+        recoverySessionTokens.remove(player.getUUID());
+    }
+
+    private Session requireRecoverySession(ServerPlayer player) throws TransitionException {
+        requireServerThread();
+        Session session = requireEditingSession(player);
+        if (session.phase() != SessionPhase.ACTIVE
+                || !session.dimension().equals(player.serverLevel().dimension())
+                || !session.world().equals(WorldIdentities.from(player.serverLevel()))
+                || session.gameMode() != gameMode(player, state.config())
+                || session.configGeneration() != state.generation())
+            throw new TransitionException("世界或共享配置已变化，请重新打开恢复中心");
+        requireEditingAdapter(session, "inventory_contents");
+        return session;
+    }
+
+    private static CompoundTag recoveryScope(Session session) { return recoveryScope(session.profiles()); }
+
+    private static CompoundTag recoveryScope(Map<String, ProfileKey> profiles) {
+        CompoundTag scope = new CompoundTag();
+        profiles.forEach((share, key) -> {
+            if (ItemProfileCompatibility.supports(share)) {
+                CompoundTag tag = new CompoundTag();
+                tag.putString("scope_type", key.scope().type().name()); tag.putString("scope_id", key.scope().id());
+                tag.putString("game_mode", key.gameMode().name()); scope.put(share, tag);
+            }
+        });
+        return scope;
+    }
+
+    private void commitRecovery(ServerPlayer player, CompoundTag expectedScope,
+            Optional<CompoundTag> expectedInventory, Optional<CompoundTag> inventory,
+            dev.yu.mwi.storage.RecoveryMutation mutation) throws IOException {
+        requireServerThread();
+        boolean[] committed = {false};
+        try {
+            withPlayerLock(player, () -> {
+                Session session = requireRecoverySession(player);
+                if (!expectedScope.equals(recoveryScope(session))) throw new TransitionException("恢复范围已变化，请重新预览");
+                try {
+                    snapshotWriter.flush(player.getUUID());
+                    SharableAdapter inventoryAdapter = requireEditingAdapter(session, "inventory_contents");
+                    CompoundTag liveInventory = inventoryAdapter.capture(player, player.registryAccess());
+                    if (expectedInventory.isPresent() && !expectedInventory.orElseThrow().equals(liveInventory))
+                        throw new IOException("背包已变化，请重新预览，未发放任何物品");
+                    LinkedHashMap<String, CompoundTag> captured = new LinkedHashMap<>();
+                    LinkedHashMap<ProfileKey, CompoundTag> writes = new LinkedHashMap<>();
+                    LinkedHashMap<String, SharableAdapter> itemAdapters = new LinkedHashMap<>();
+                    session.activeAdapters().forEach((share, adapter) -> {
+                        if (ItemProfileCompatibility.supports(share)) {
+                            itemAdapters.put(share, adapter); captured.put(share, adapter.capture(player, player.registryAccess()));
+                        }
+                    });
+                    inventory.ifPresent(after -> captured.put("inventory_contents", after));
+                    captured.forEach((share, payload) -> writes.put(session.profiles().get(share), payload));
+                    collectWorldBackups(player, session.world(), session.profiles(), itemAdapters, captured, writes);
+                    long revision = store.nextRevision(player.getUUID());
+                    store.commitRecovery(player.getUUID(), revision, writes, mutation);
+                    committed[0] = true;
+                    snapshotWriter.refreshWorkingSetIfLoaded(player.getUUID(), revision, writes);
+                    if (inventory.isPresent()) {
+                        replace(player, List.of(inventoryAdapter), () -> inventoryAdapter.apply(
+                                player, inventory.orElseThrow(), player.registryAccess()));
+                        if (!inventory.orElseThrow().equals(inventoryAdapter.capture(player, player.registryAccess())))
+                            throw new IOException("恢复应用后背包回读不一致");
+                    }
+                    recoveryCheckpoints.add(player.getUUID());
+                    try { dev.yu.mwi.recovery.RecoveryCheckpoint.save(player, mutation.operationId()); }
+                    finally { recoveryCheckpoints.remove(player.getUUID()); }
+                } catch (IOException failure) { throw new TransitionException(failure.getMessage(), failure); }
+            });
+        } catch (TransitionException | RuntimeException failure) {
+            if (committed[0] || hasPendingCommit(failure)) {
+                quarantine(player, failure); // Never roll back/regrant after durable commit; login uses newest profiles.
+            }
+            throw new IOException(committed[0] || hasPendingCommit(failure)
+                    ? "恢复已写入凭证，应用待核验；请重启服务器完成续接，禁止重复补发" : failure.getMessage(), failure);
+        }
     }
 
     private static ProfileStore createStore(MinecraftServer server, RuntimeConfig config) throws IOException {
@@ -246,6 +362,7 @@ public final class InventoryIsolationService implements AutoCloseable {
                 sessions.remove(player.getUUID(), session);
             }
             playerLocks.remove(player.getUUID());
+            recoverySessionTokens.remove(player.getUUID());
             quarantinedPlayers.remove(player.getUUID());
         }
     }
@@ -287,6 +404,7 @@ public final class InventoryIsolationService implements AutoCloseable {
 
     private void checkpoint(ServerPlayer player, String reason, boolean asynchronous) throws TransitionException {
         requireServerThread();
+        if (recoveryCheckpoints.contains(player.getUUID())) return;
         Session session = sessions.get(player.getUUID());
         if (session == null || session.owner() != player) {
             throw new TransitionException(

@@ -8,7 +8,6 @@ import java.io.IOException;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -84,11 +83,9 @@ final class AtomicNbtFile {
                 channel.force(true);
             }
             faultInjector.beforeMove(temporary, file);
-            try {
-                Files.move(temporary, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
-            }
+            // A non-atomic fallback can tear the WAL or its permanent recovery receipt.
+            Files.move(temporary, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            faultInjector.afterMove(file);
             forceDirectory(parent);
         } finally {
             Files.deleteIfExists(temporary);
@@ -125,6 +122,9 @@ final class AtomicNbtFile {
         }
 
         default void beforeMove(Path temporary, Path destination) throws IOException {
+        }
+
+        default void afterMove(Path destination) throws IOException {
         }
     }
 }

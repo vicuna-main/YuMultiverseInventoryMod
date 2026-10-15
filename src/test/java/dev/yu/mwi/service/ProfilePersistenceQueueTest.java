@@ -43,6 +43,11 @@ class ProfilePersistenceQueueTest {
 
         IOException failure = assertThrows(IOException.class, () -> queue.flush(playerId));
         assertEquals("disk unavailable", failure.getMessage());
+        assertThrows(IOException.class, () -> queue.flush(playerId),
+                "Acknowledging an I/O error must not reopen the synchronous recovery write barrier");
+        UUID healthy = UUID.randomUUID();
+        queue.submit(healthy, () -> {});
+        queue.flush(healthy);
         queue.close();
     }
 

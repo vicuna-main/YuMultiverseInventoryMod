@@ -44,6 +44,7 @@ final class RevisionRecoveryService {
                     TransitionJournal.recoverBefore(sourceJournal),
                     adapters,
                     advancementMigration);
+            requireNoRecoveryConflict(player.getUUID(), recovered.stream().map(TransitionJournal.RecoveredChange::recoveryKey).toList());
             LinkedHashMap<ProfileKey, StoredProfile> diskBefore = validateAndCapture(
                     player, recovered, activeProfiles, adapters, liveBefore);
             LinkedHashMap<SharableAdapter, CompoundTag> liveRecovery = liveRecovery(
@@ -93,6 +94,24 @@ final class RevisionRecoveryService {
             }
             throw new RecoveryException(
                     "Unable to recover revision " + requestedRevision, failure, unsafe);
+        }
+    }
+
+    /** Fence only item scopes that have a recovery entitlement; ordinary players retain revision tools. */
+    void requireNoRecoveryConflict(java.util.UUID owner, List<ProfileKey> keys) throws IOException, RecoveryException {
+        var itemKeys = keys.stream().filter(key -> dev.yu.mwi.compat.ItemProfileCompatibility.supports(key.shareId())).toList();
+        if (itemKeys.isEmpty()) return;
+        for (var summary : store.listRecoveries(owner)) {
+            var payload = store.loadRecovery(owner, summary.sourceId()).orElseThrow(() -> new IOException("恢复凭证读取不完整")).payload();
+            var identity = payload.getCompound("identity");
+            if ("grave_claim".equals(identity.getCompound("evidence").getString("type"))) continue;
+            for (ProfileKey key : itemKeys) {
+                var scope = identity.getCompound("scope").getCompound(key.shareId());
+                if (key.scope().type().name().equals(scope.getString("scope_type"))
+                        && key.scope().id().equals(scope.getString("scope_id"))
+                        && key.gameMode().name().equals(scope.getString("game_mode")))
+                    throw new RecoveryException("该物品范围已有恢复凭证，请使用 /mwirecovery 核验；禁止历史回滚绕过来源额度", null, false);
+            }
         }
     }
 

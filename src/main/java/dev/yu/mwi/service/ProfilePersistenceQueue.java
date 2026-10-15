@@ -168,6 +168,10 @@ final class ProfilePersistenceQueue implements AutoCloseable {
         IOException recorded;
         synchronized (this) {
             recorded = failures.remove(playerId);
+            if (recorded == null && unhealthyPlayers.contains(playerId)) {
+                recorded = new IOException("Profile persistence remains unhealthy for " + playerId
+                        + "; restart and reconcile before another synchronous write");
+            }
         }
         if (observed != null) {
             throw observed;
