@@ -112,6 +112,10 @@ configurations {
 
 dependencyLocking {
     lockAllConfigurations()
+    // Minecraft adds Netty's epoll transport only on Linux.
+    if (providers.systemProperty('os.name').get().equalsIgnoreCase('Linux')) {
+        lockFile = file('gradle/linux.lockfile')
+    }
 }
 
 dependencies {

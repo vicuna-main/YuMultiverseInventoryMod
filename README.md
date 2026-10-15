@@ -317,6 +317,8 @@ GitHub Actions 在 Linux 和 Windows 上执行 `build --dependency-verification 
 生成的 Minecraft 1.21.1 资源 JAR 和 NeoForge 21.1.244 重编译 JAR 使用精确的本地产物规则，
 避免把某台机器的中间产物哈希当作其他平台的下载校验值。这两个内部依赖组只能从
 NeoGradle 的本地仓库解析，不能回退到远端仓库。
+Linux 的 Minecraft 依赖额外包含 Netty epoll，使用 `gradle/linux.lockfile`；其他系统继续使用
+`gradle.lockfile`。升级依赖后须在对应平台运行 `--write-locks` 并提交各自锁文件。
 
 ## 模块边界
 
