@@ -312,6 +312,12 @@ MWI 会继续当前登录、保存或世界切换事务，不再因为这一项�
 
 生成 jar 位于 `build/libs/`。
 
+GitHub Actions 在 Linux 和 Windows 上执行 `build --dependency-verification strict`。
+下载的依赖和插件继续按 `gradle/verification-metadata.xml` 校验；仅对 NeoGradle 在本次构建中
+生成的 Minecraft 1.21.1 资源 JAR 和 NeoForge 21.1.244 重编译 JAR 使用精确的本地产物规则，
+避免把某台机器的中间产物哈希当作其他平台的下载校验值。这两个内部依赖组只能从
+NeoGradle 的本地仓库解析，不能回退到远端仓库。
+
 ## 模块边界
 
 本仓库实现 NeoForge 权威数据层与 Curios 集成，不包含可选 Bukkit bridge。因此 Vault economy、

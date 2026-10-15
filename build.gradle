@@ -26,6 +26,14 @@ sourceSets.main.resources {
 }
 
 repositories {
+    // NeoGradle produces these coordinates locally; never resolve them from a remote repository.
+    exclusiveContent {
+        forRepository { repositories.getByName('NeoGradle Artifacts') }
+        filter {
+            includeGroup 'ng_dummy_ng.net.minecraft'
+            includeGroup 'ng_dummy_ng.net.neoforged'
+        }
+    }
     mavenCentral()
     maven {
         name = 'Curios'
