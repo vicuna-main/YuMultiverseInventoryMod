@@ -8,7 +8,6 @@ import java.io.IOException;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -31,7 +30,22 @@ final class AtomicNbtFile {
     }
 
     private static CompoundTag read(Path file, long maxBytes) throws IOException {
-        return NbtIo.readCompressed(file, NbtAccounter.create(maxBytes));
+        try (var input = new java.util.zip.GZIPInputStream(Files.newInputStream(file));
+             var data = new java.io.DataInputStream(new java.io.BufferedInputStream(input))) {
+            CompoundTag result = NbtIo.read(data, NbtAccounter.create(maxBytes));
+            // NBT parsing stops at TAG_End. Read through EOF to validate the gzip trailer/CRC.
+            if (data.read() != -1) {
+                throw new IOException("Unexpected bytes after root NBT tag");
+            }
+            return result;
+        } catch (net.minecraft.ReportedException failure) {
+            if (failure.getCause() instanceof IOException || failure.getCause() instanceof net.minecraft.nbt.NbtException) {
+                throw new ProfileCorruptionException(file, "Invalid compressed NBT", failure);
+            }
+            throw failure;
+        } catch (net.minecraft.nbt.NbtException | NegativeArraySizeException failure) {
+            throw new ProfileCorruptionException(file, "Invalid NBT structure or size", failure);
+        }
     }
 
     static void write(Path file, CompoundTag data) throws IOException {
@@ -44,11 +58,16 @@ final class AtomicNbtFile {
             throw new IOException("NBT file has no parent directory: " + file);
         }
         Files.createDirectories(parent);
+        ByteArrayOutputStream encoded = new ByteArrayOutputStream();
+        NbtIo.writeCompressed(data, encoded);
+        writeBytes(file, encoded.toByteArray(), faultInjector);
+    }
+
+    static void writeBytes(Path file, byte[] bytes, FaultInjector faultInjector) throws IOException {
+        Path parent = file.getParent();
+        Files.createDirectories(parent);
         Path temporary = parent.resolve(file.getFileName() + ".tmp-" + UUID.randomUUID());
         try {
-            ByteArrayOutputStream encoded = new ByteArrayOutputStream();
-            NbtIo.writeCompressed(data, encoded);
-            byte[] bytes = encoded.toByteArray();
             faultInjector.beforeWrite(temporary, file, bytes.length);
             try (FileChannel channel = FileChannel.open(
                     temporary, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
@@ -64,11 +83,9 @@ final class AtomicNbtFile {
                 channel.force(true);
             }
             faultInjector.beforeMove(temporary, file);
-            try {
-                Files.move(temporary, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
-            }
+            // A non-atomic fallback can tear the WAL or its permanent recovery receipt.
+            Files.move(temporary, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            faultInjector.afterMove(file);
             forceDirectory(parent);
         } finally {
             Files.deleteIfExists(temporary);
@@ -105,6 +122,9 @@ final class AtomicNbtFile {
         }
 
         default void beforeMove(Path temporary, Path destination) throws IOException {
+        }
+
+        default void afterMove(Path destination) throws IOException {
         }
     }
 }

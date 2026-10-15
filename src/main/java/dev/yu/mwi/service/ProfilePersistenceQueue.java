@@ -33,10 +33,14 @@ final class ProfilePersistenceQueue implements AutoCloseable {
     private final Map<UUID, IOException> failures = new LinkedHashMap<>();
     private final Set<UUID> unhealthyPlayers = new HashSet<>();
     private final List<Long> completedLatenciesNanos = new ArrayList<>();
+    private final List<Long> completedExecutionLatenciesNanos = new ArrayList<>();
     private final List<Long> activeEnqueuedNanos = new ArrayList<>();
     private int queuedTasks;
     private int coalescedTasks;
     private long failedTasks;
+    private long queuedSubmissions;
+    private long rejectedSubmissions;
+    private int activeWorkers;
     private long oldestEnqueuedNanos;
     private boolean accepting = true;
 
@@ -67,23 +71,28 @@ final class ProfilePersistenceQueue implements AutoCloseable {
         java.util.Objects.requireNonNull(playerId, "playerId");
         java.util.Objects.requireNonNull(action, "action");
         if (!accepting) {
+            rejectedSubmissions++;
             throw new RejectedExecutionException("Profile persistence queue is stopping");
         }
         IOException priorFailure = failures.get(playerId);
         if (unhealthyPlayers.contains(playerId)) {
+            rejectedSubmissions++;
             throw new RejectedExecutionException("Profile persistence is unhealthy for " + playerId, priorFailure);
         }
         if (action instanceof CoalescingIoAction newer) {
             CoalescingIoAction pending = pendingCoalescing.get(playerId);
             if (pending != null && pending.merge(newer)) {
+                queuedSubmissions++;
                 coalescedTasks++;
                 return;
             }
         }
         if (queuedTasks >= capacity) {
+            rejectedSubmissions++;
             throw new RejectedExecutionException(
                     "Profile persistence queue is full (capacity=" + capacity + ")");
         }
+        queuedSubmissions++;
 
         long enqueuedNanos = System.nanoTime();
         if (queuedTasks == 0) {
@@ -96,13 +105,22 @@ final class ProfilePersistenceQueue implements AutoCloseable {
             pendingCoalescing.put(playerId, coalescing);
         }
         CompletableFuture<Void> next = previous.thenRunAsync(() -> {
+            long executionStarted = System.nanoTime();
             try {
                 synchronized (ProfilePersistenceQueue.this) {
                     pendingCoalescing.remove(playerId, action);
+                    activeWorkers++;
                 }
+                executionStarted = System.nanoTime();
                 action.run();
             } catch (IOException failure) {
                 throw new CompletionException(failure);
+            } finally {
+                synchronized (ProfilePersistenceQueue.this) {
+                    activeWorkers--;
+                    completedExecutionLatenciesNanos.add(System.nanoTime() - executionStarted);
+                    trimSamples(completedExecutionLatenciesNanos);
+                }
             }
         }, executor);
         tails.put(playerId, next);
@@ -120,9 +138,7 @@ final class ProfilePersistenceQueue implements AutoCloseable {
             }
         }
         completedLatenciesNanos.add(System.nanoTime() - enqueuedNanos);
-        if (completedLatenciesNanos.size() > 2_048) {
-            completedLatenciesNanos.subList(0, 1_024).clear();
-        }
+        trimSamples(completedLatenciesNanos);
         tails.remove(playerId, task);
         oldestEnqueuedNanos = activeEnqueuedNanos.stream().mapToLong(Long::longValue).min().orElse(0L);
         notifyAll();
@@ -152,6 +168,10 @@ final class ProfilePersistenceQueue implements AutoCloseable {
         IOException recorded;
         synchronized (this) {
             recorded = failures.remove(playerId);
+            if (recorded == null && unhealthyPlayers.contains(playerId)) {
+                recorded = new IOException("Profile persistence remains unhealthy for " + playerId
+                        + "; restart and reconcile before another synchronous write");
+            }
         }
         if (observed != null) {
             throw observed;
@@ -188,6 +208,7 @@ final class ProfilePersistenceQueue implements AutoCloseable {
 
     synchronized Metrics metrics() {
         List<Long> latencies = completedLatenciesNanos.stream().sorted().toList();
+        List<Long> executionLatencies = completedExecutionLatenciesNanos.stream().sorted().toList();
         long now = System.nanoTime();
         return new Metrics(
                 queuedTasks,
@@ -195,7 +216,12 @@ final class ProfilePersistenceQueue implements AutoCloseable {
                 percentile(latencies, 0.95),
                 percentile(latencies, 0.99),
                 failedTasks,
-                coalescedTasks);
+                coalescedTasks,
+                queuedSubmissions,
+                rejectedSubmissions,
+                activeWorkers,
+                percentile(executionLatencies, 0.95),
+                percentile(executionLatencies, 0.99));
     }
 
     @Override
@@ -262,6 +288,12 @@ final class ProfilePersistenceQueue implements AutoCloseable {
         return Duration.ofNanos(sortedNanos.get(index));
     }
 
+    private static void trimSamples(List<Long> samples) {
+        if (samples.size() > 2_048) {
+            samples.subList(0, 1_024).clear();
+        }
+    }
+
     private static Throwable unwrap(Throwable failure) {
         Throwable current = failure;
         while ((current instanceof CompletionException || current instanceof java.util.concurrent.ExecutionException)
@@ -281,7 +313,12 @@ final class ProfilePersistenceQueue implements AutoCloseable {
             Duration p95WriteLatency,
             Duration p99WriteLatency,
             long failures,
-            long coalesced) {
+            long coalesced,
+            long queued,
+            long rejected,
+            int activeWorkers,
+            Duration p95CommitLatency,
+            Duration p99CommitLatency) {
     }
 
     @FunctionalInterface

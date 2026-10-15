@@ -9,6 +9,7 @@ import net.minecraft.server.level.ServerPlayer;
 public final class ExperiencePointsAdapter extends AbstractVanillaAdapter {
     private static final String TOTAL = "total";
     private static final String PROGRESS = "progress";
+    private static final float MAX_REASONABLE_MODDED_PROGRESS = 1_000_000.0F;
 
     public ExperiencePointsAdapter() {
         super(AdapterIds.XP);
@@ -19,6 +20,7 @@ public final class ExperiencePointsAdapter extends AbstractVanillaAdapter {
         CompoundTag data = new CompoundTag();
         data.putInt(TOTAL, player.totalExperience);
         data.putFloat(PROGRESS, player.experienceProgress);
+        validatePayload(data, id().toString());
         return data;
     }
 
@@ -30,17 +32,26 @@ public final class ExperiencePointsAdapter extends AbstractVanillaAdapter {
 
     @Override
     public void apply(ServerPlayer player, CompoundTag data, HolderLookup.Provider lookup) {
-        NbtPayload.requireData(data, id().toString());
-        int total = NbtPayload.requireInt(data, TOTAL, id().toString());
-        float progress = NbtPayload.requireFloat(data, PROGRESS, id().toString());
+        ValidatedExperience values = validatePayload(data, id().toString());
+        player.totalExperience = values.total();
+        player.experienceProgress = values.progress();
+    }
+
+    static ValidatedExperience validatePayload(CompoundTag data, String adapterId) {
+        NbtPayload.requireData(data, adapterId);
+        int total = NbtPayload.requireInt(data, TOTAL, adapterId);
+        float progress = NbtPayload.requireFloat(data, PROGRESS, adapterId);
         if (total < 0) {
-            throw NbtPayload.invalid(id().toString(), "total experience must be non-negative");
+            throw NbtPayload.invalid(adapterId, "total experience must be non-negative");
         }
-        if (progress < 0.0F || progress >= 1.0F) {
-            throw NbtPayload.invalid(id().toString(), "progress must be in [0, 1)");
+        if (progress < 0.0F || progress > MAX_REASONABLE_MODDED_PROGRESS) {
+            throw NbtPayload.invalid(
+                    adapterId, "progress must be finite and in [0, " + MAX_REASONABLE_MODDED_PROGRESS + "]");
         }
-        player.totalExperience = total;
-        player.experienceProgress = progress;
+        return new ValidatedExperience(total, progress);
+    }
+
+    record ValidatedExperience(int total, float progress) {
     }
 
     @Override

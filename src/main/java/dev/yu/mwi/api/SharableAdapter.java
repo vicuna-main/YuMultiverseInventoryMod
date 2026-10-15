@@ -21,6 +21,12 @@ public interface SharableAdapter {
         return true;
     }
 
+    /**
+     * Captures a persistable snapshot. Implementations with semantic payload validation must apply
+     * the same contract here and in {@link #apply}; MWI must never successfully capture/persist a
+     * payload that the same adapter would reject when restoring under the same registry/runtime
+     * conditions.
+     */
     CompoundTag capture(ServerPlayer player, HolderLookup.Provider lookup);
 
     /**

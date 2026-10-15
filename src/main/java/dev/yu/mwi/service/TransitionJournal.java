@@ -33,6 +33,29 @@ final class TransitionJournal {
         return journal;
     }
 
+    /**
+     * Prepares a login journal without claiming that the vanilla login snapshot is the canonical
+     * target's durable before-image. Existing target payloads are stored separately so startup
+     * recovery can restore the real canonical value; an absent target is marked explicitly.
+     */
+    static CompoundTag preparedLogin(
+            String world,
+            List<Change> changes,
+            java.util.Map<ProfileKey, CompoundTag> canonicalBefore) {
+        CompoundTag journal = prepared("login", world, world, changes);
+        ListTag list = journal.getList("changes", Tag.TAG_COMPOUND);
+        for (int i = 0; i < changes.size() && i < list.size(); i++) {
+            Change change = changes.get(i);
+            CompoundTag item = list.getCompound(i);
+            CompoundTag canonical = canonicalBefore.get(change.toKey());
+            item.putBoolean("target_existed", canonical != null);
+            if (canonical != null) {
+                item.put("canonical_before", canonical.copy());
+            }
+        }
+        return journal;
+    }
+
     static void complete(CompoundTag journal, String status, List<Change> changes, String error) {
         journal.putString("status", status);
         if (error != null && !error.isBlank()) {

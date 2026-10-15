@@ -47,12 +47,14 @@ public final class NeoForgeEventHandler {
     @SubscribeEvent
     public void onRegisterCommands(RegisterCommandsEvent event) {
         MwiCommands.register(event.getDispatcher(), controller);
+        dev.yu.mwi.recovery.RecoveryCommands.register(event.getDispatcher());
     }
 
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onLogin(PlayerEvent.PlayerLoggedInEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
             runPlayerEvent(player, () -> controller.login(player));
+            dev.yu.mwi.recovery.RecoveryCommands.notifyPlayer(player);
         }
     }
 
@@ -73,7 +75,8 @@ public final class NeoForgeEventHandler {
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onDimensionChanged(PlayerEvent.PlayerChangedDimensionEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
-            runPlayerEvent(player, () -> controller.dimensionChanged(player));
+            runPlayerEvent(player, () -> controller.dimensionChanged(player, event.getFrom(), event.getTo()));
+            dev.yu.mwi.recovery.RecoveryNotifications.enqueue(player);
         }
     }
 
@@ -81,7 +84,13 @@ public final class NeoForgeEventHandler {
     public void onRespawn(PlayerEvent.PlayerRespawnEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
             runPlayerEvent(player, () -> controller.respawned(player));
+            dev.yu.mwi.recovery.RecoveryCommands.notifyPlayer(player);
         }
+    }
+
+    @SubscribeEvent
+    public void onGameModeChanging(PlayerEvent.PlayerChangeGameModeEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) controller.invalidateRecoveryConfirmation(player);
     }
 
     @SubscribeEvent(priority = EventPriority.LOWEST)
@@ -94,6 +103,7 @@ public final class NeoForgeEventHandler {
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onServerTick(ServerTickEvent.Post event) {
         controller.flushPendingLogouts(event.getServer());
+        dev.yu.mwi.recovery.RecoveryNotifications.tick(event.getServer());
     }
 
     private void runPlayerEvent(ServerPlayer player, PlayerAction action) {

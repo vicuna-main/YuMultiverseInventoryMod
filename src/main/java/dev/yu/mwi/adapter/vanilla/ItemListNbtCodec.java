@@ -9,7 +9,7 @@ import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.world.item.ItemStack;
 
-final class ItemListNbtCodec {
+public final class ItemListNbtCodec {
     private static final String SIZE = "size";
     private static final String ITEMS = "items";
     private static final String SLOT = "slot";
@@ -18,7 +18,7 @@ final class ItemListNbtCodec {
     private ItemListNbtCodec() {
     }
 
-    static CompoundTag encode(List<ItemStack> slots, HolderLookup.Provider lookup) {
+    public static CompoundTag encode(List<ItemStack> slots, HolderLookup.Provider lookup) {
         CompoundTag data = new CompoundTag();
         data.putInt(SIZE, slots.size());
         ListTag items = new ListTag();
@@ -40,7 +40,7 @@ final class ItemListNbtCodec {
         return data;
     }
 
-    static List<ItemStack> decode(
+    public static List<ItemStack> decode(
             CompoundTag data, int expectedSize, HolderLookup.Provider lookup, String adapterId) {
         NbtPayload.requireData(data, adapterId);
         int size = NbtPayload.requireInt(data, SIZE, adapterId);

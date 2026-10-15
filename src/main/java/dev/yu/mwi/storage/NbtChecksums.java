@@ -32,7 +32,7 @@ import java.util.zip.GZIPInputStream;
  * being read back. The canonical algorithm below sorts compound keys recursively and preserves list
  * order, making the digest independent of map iteration order.</p>
  */
-final class NbtChecksums {
+public final class NbtChecksums {
     static final String CANONICAL_ALGORITHM = "canonical_nbt_sha256_v1";
 
     private static final int MAX_DEPTH = 512;
@@ -42,7 +42,7 @@ final class NbtChecksums {
     private NbtChecksums() {
     }
 
-    static String canonicalSha256(CompoundTag payload) throws IOException {
+    public static String canonicalSha256(CompoundTag payload) throws IOException {
         return canonicalDigest(payload).sha256();
     }
 

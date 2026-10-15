@@ -4,7 +4,16 @@ import dev.yu.mwi.api.AdapterRegistry;
 import dev.yu.mwi.api.AdapterIds;
 import dev.yu.mwi.api.ItemEditSlotPolicy;
 import dev.yu.mwi.api.SharableAdapter;
+import dev.yu.mwi.adapter.vanilla.AdvancementAdapter;
+import dev.yu.mwi.adapter.vanilla.AdvancementCompatibilityReport;
+import dev.yu.mwi.adapter.vanilla.AdvancementPreparation;
+import dev.yu.mwi.adapter.vanilla.RespawnLocationPayload;
 import dev.yu.mwi.config.RuntimeConfig;
+import dev.yu.mwi.config.MwiConfig;
+import dev.yu.mwi.compat.ItemCompatibilityIssue;
+import dev.yu.mwi.compat.ItemCompatibilityReport;
+import dev.yu.mwi.compat.ItemPayloadPreparation;
+import dev.yu.mwi.compat.ItemProfileCompatibility;
 import dev.yu.mwi.domain.GameModeBucket;
 import dev.yu.mwi.domain.GroupResolver;
 import dev.yu.mwi.domain.ProfileKey;
@@ -12,13 +21,20 @@ import dev.yu.mwi.domain.ScopeKey;
 import dev.yu.mwi.domain.ShareCatalog;
 import dev.yu.mwi.domain.WorldIdentity;
 import dev.yu.mwi.storage.CacheStats;
+import dev.yu.mwi.storage.CompatibilityArchiveEntry;
 import dev.yu.mwi.storage.NbtProfileStore;
 import dev.yu.mwi.storage.PendingTransactionException;
 import dev.yu.mwi.storage.ProfileStore;
+import dev.yu.mwi.storage.ProfileArchive;
+import dev.yu.mwi.storage.PlayerProfileIds;
 import dev.yu.mwi.storage.StoredProfile;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.Level;
@@ -57,13 +73,21 @@ public final class InventoryIsolationService implements AutoCloseable {
     private final ProfileSnapshotWriter snapshotWriter;
     private final ProfileMigrationService migrationService;
     private final RevisionRecoveryService recoveryService;
+    private final dev.yu.mwi.recovery.RecoveryCenter recoveryCenter;
+    private final Set<UUID> recoveryCheckpoints = new java.util.HashSet<>();
+    private final Map<UUID, RecoverySessionToken> recoverySessionTokens = new HashMap<>();
+    private long nextRecoverySessionToken;
+    private record RecoverySessionToken(Session session, long token) {}
     private final Map<UUID, Session> sessions = new ConcurrentHashMap<>();
     private final Map<UUID, ReentrantLock> playerLocks = new ConcurrentHashMap<>();
     private final Set<UUID> activeTransactions = ConcurrentHashMap.newKeySet();
-    private final Set<UUID> crashRecoveredPlayers = ConcurrentHashMap.newKeySet();
     private final Set<UUID> quarantinedPlayers = ConcurrentHashMap.newKeySet();
     private final List<Long> dimensionCaptureLatenciesNanos = new ArrayList<>();
+    private final List<Long> revisionAllocationLatenciesNanos = new ArrayList<>();
+    private final LongAdder quarantineEvents = new LongAdder();
     private final LoginPerformanceTracker loginPerformance = new LoginPerformanceTracker();
+    private final CompatibilityDiagnostics compatibilityDiagnostics = new CompatibilityDiagnostics();
+    private final AtomicLong missingItemBatchCursor = new AtomicLong();
     private volatile State state;
 
     public InventoryIsolationService(
@@ -88,6 +112,117 @@ public final class InventoryIsolationService implements AutoCloseable {
         this.migrationService = new ProfileMigrationService(server, snapshotWriter, logger);
         this.recoveryService = new RevisionRecoveryService(store);
         this.state = State.create(config, adapters, 1L);
+        this.recoveryCenter = new dev.yu.mwi.recovery.RecoveryCenter(store,
+                new dev.yu.mwi.recovery.RecoveryCenter.Host() {
+                    @Override public void awaitPendingWrites(UUID owner) throws IOException {
+                        requireServerThread();
+                        snapshotWriter.flush(owner);
+                    }
+                    @Override public String sessionToken(ServerPlayer player) throws IOException {
+                        try {
+                            Session session = requireRecoverySession(player);
+                            RecoverySessionToken token = recoverySessionTokens.get(player.getUUID());
+                            if (token == null || token.session() != session) {
+                                token = new RecoverySessionToken(session, Math.incrementExact(nextRecoverySessionToken));
+                                nextRecoverySessionToken = token.token(); recoverySessionTokens.put(player.getUUID(), token);
+                            }
+                            return Long.toString(token.token());
+                        } catch (TransitionException failure) { throw new IOException(failure.getMessage(), failure); }
+                    }
+                    @Override public CompoundTag scope(ServerPlayer player) throws IOException {
+                        try { return recoveryScope(requireRecoverySession(player)); }
+                        catch (TransitionException failure) { throw new IOException(failure.getMessage(), failure); }
+                    }
+                    @Override public void commit(ServerPlayer player, CompoundTag scope,
+                            Optional<CompoundTag> expectedInventory, Optional<CompoundTag> inventory,
+                            dev.yu.mwi.storage.RecoveryMutation mutation) throws IOException {
+                        commitRecovery(player, scope, expectedInventory, inventory, mutation);
+                    }
+                });
+    }
+
+    public dev.yu.mwi.recovery.RecoveryCenter recoveryCenter() { return recoveryCenter; }
+
+    public void invalidateRecoveryConfirmation(ServerPlayer player) {
+        requireServerThread();
+        recoverySessionTokens.remove(player.getUUID());
+    }
+
+    private Session requireRecoverySession(ServerPlayer player) throws TransitionException {
+        requireServerThread();
+        Session session = requireEditingSession(player);
+        if (session.phase() != SessionPhase.ACTIVE
+                || !session.dimension().equals(player.serverLevel().dimension())
+                || !session.world().equals(WorldIdentities.from(player.serverLevel()))
+                || session.gameMode() != gameMode(player, state.config())
+                || session.configGeneration() != state.generation())
+            throw new TransitionException("世界或共享配置已变化，请重新打开恢复中心");
+        requireEditingAdapter(session, "inventory_contents");
+        return session;
+    }
+
+    private static CompoundTag recoveryScope(Session session) { return recoveryScope(session.profiles()); }
+
+    private static CompoundTag recoveryScope(Map<String, ProfileKey> profiles) {
+        CompoundTag scope = new CompoundTag();
+        profiles.forEach((share, key) -> {
+            if (ItemProfileCompatibility.supports(share)) {
+                CompoundTag tag = new CompoundTag();
+                tag.putString("scope_type", key.scope().type().name()); tag.putString("scope_id", key.scope().id());
+                tag.putString("game_mode", key.gameMode().name()); scope.put(share, tag);
+            }
+        });
+        return scope;
+    }
+
+    private void commitRecovery(ServerPlayer player, CompoundTag expectedScope,
+            Optional<CompoundTag> expectedInventory, Optional<CompoundTag> inventory,
+            dev.yu.mwi.storage.RecoveryMutation mutation) throws IOException {
+        requireServerThread();
+        boolean[] committed = {false};
+        try {
+            withPlayerLock(player, () -> {
+                Session session = requireRecoverySession(player);
+                if (!expectedScope.equals(recoveryScope(session))) throw new TransitionException("恢复范围已变化，请重新预览");
+                try {
+                    snapshotWriter.flush(player.getUUID());
+                    SharableAdapter inventoryAdapter = requireEditingAdapter(session, "inventory_contents");
+                    CompoundTag liveInventory = inventoryAdapter.capture(player, player.registryAccess());
+                    if (expectedInventory.isPresent() && !expectedInventory.orElseThrow().equals(liveInventory))
+                        throw new IOException("背包已变化，请重新预览，未发放任何物品");
+                    LinkedHashMap<String, CompoundTag> captured = new LinkedHashMap<>();
+                    LinkedHashMap<ProfileKey, CompoundTag> writes = new LinkedHashMap<>();
+                    LinkedHashMap<String, SharableAdapter> itemAdapters = new LinkedHashMap<>();
+                    session.activeAdapters().forEach((share, adapter) -> {
+                        if (ItemProfileCompatibility.supports(share)) {
+                            itemAdapters.put(share, adapter); captured.put(share, adapter.capture(player, player.registryAccess()));
+                        }
+                    });
+                    inventory.ifPresent(after -> captured.put("inventory_contents", after));
+                    captured.forEach((share, payload) -> writes.put(session.profiles().get(share), payload));
+                    collectWorldBackups(player, session.world(), session.profiles(), itemAdapters, captured, writes);
+                    long revision = store.nextRevision(player.getUUID());
+                    store.commitRecovery(player.getUUID(), revision, writes, mutation);
+                    committed[0] = true;
+                    snapshotWriter.refreshWorkingSetIfLoaded(player.getUUID(), revision, writes);
+                    if (inventory.isPresent()) {
+                        replace(player, List.of(inventoryAdapter), () -> inventoryAdapter.apply(
+                                player, inventory.orElseThrow(), player.registryAccess()));
+                        if (!inventory.orElseThrow().equals(inventoryAdapter.capture(player, player.registryAccess())))
+                            throw new IOException("恢复应用后背包回读不一致");
+                    }
+                    recoveryCheckpoints.add(player.getUUID());
+                    try { dev.yu.mwi.recovery.RecoveryCheckpoint.save(player, mutation.operationId()); }
+                    finally { recoveryCheckpoints.remove(player.getUUID()); }
+                } catch (IOException failure) { throw new TransitionException(failure.getMessage(), failure); }
+            });
+        } catch (TransitionException | RuntimeException failure) {
+            if (committed[0] || hasPendingCommit(failure)) {
+                quarantine(player, failure); // Never roll back/regrant after durable commit; login uses newest profiles.
+            }
+            throw new IOException(committed[0] || hasPendingCommit(failure)
+                    ? "恢复已写入凭证，应用待核验；请重启服务器完成续接，禁止重复补发" : failure.getMessage(), failure);
+        }
     }
 
     private static ProfileStore createStore(MinecraftServer server, RuntimeConfig config) throws IOException {
@@ -104,6 +239,13 @@ public final class InventoryIsolationService implements AutoCloseable {
         requireServerThread();
         Session existing = sessions.get(player.getUUID());
         if (existing != null && existing.owner() == player) {
+            if (quarantinedPlayers.contains(player.getUUID())) {
+                throw new TransitionException("A quarantined inventory session cannot be activated");
+            }
+            if (existing.phase() == SessionPhase.PROVISIONAL) {
+                withPlayerLock(player, () -> completeProvisionalLogin(player));
+                quarantinedPlayers.remove(player.getUUID());
+            }
             return;
         }
         if (existing != null) {
@@ -118,14 +260,40 @@ public final class InventoryIsolationService implements AutoCloseable {
         quarantinedPlayers.remove(player.getUUID());
     }
 
-    public void dimensionChanged(ServerPlayer player) throws TransitionException {
+    public void dimensionChanged(
+            ServerPlayer player,
+            ResourceKey<Level> fromDimension,
+            ResourceKey<Level> toDimension) throws TransitionException {
         requireServerThread();
+        Objects.requireNonNull(player, "player");
+        Objects.requireNonNull(fromDimension, "fromDimension");
+        Objects.requireNonNull(toDimension, "toDimension");
         if (activeTransactions.contains(player.getUUID())) {
             return;
         }
         long started = System.nanoTime();
         try {
-            withPlayerLock(player, () -> reconcile(player, "dimension_change"));
+            Session existing = sessions.get(player.getUUID());
+            if (existing != null && existing.owner() != player) {
+                sessions.remove(player.getUUID(), existing);
+                try {
+                    snapshotWriter.flush(player.getUUID());
+                } catch (IOException failure) {
+                    throw new TransitionException(
+                            "Unable to finish earlier profile persistence before dimension transition", failure);
+                }
+            }
+            withPlayerLock(player, () -> {
+                Session current = sessions.get(player.getUUID());
+                if (current == null) {
+                    bootstrapProvisionalSession(player, fromDimension, toDimension);
+                } else {
+                    if (current.phase() == SessionPhase.PROVISIONAL) {
+                        logPreLoginTransition(player, fromDimension, toDimension, current, "reconcile");
+                    }
+                    reconcile(player, toDimension, "dimension_change");
+                }
+            });
         } finally {
             recordDimensionCapture(System.nanoTime() - started);
         }
@@ -177,9 +345,13 @@ public final class InventoryIsolationService implements AutoCloseable {
                 return;
             }
             withPlayerLock(player, () -> {
-                if (session != null) {
-                    reconcile(player, "logout_reconcile");
+                if (session == null) {
+                    // No MWI session ever established ownership of this live snapshot. Preserve it for
+                    // diagnostics/recovery, but never derive a canonical scope from currentWorld.
+                    persistQuarantined(player, "disconnect without an owned inventory session");
+                    return;
                 }
+                reconcile(player, "logout_reconcile");
                 persistCurrent(player, "logout", true);
             });
         } finally {
@@ -190,6 +362,7 @@ public final class InventoryIsolationService implements AutoCloseable {
                 sessions.remove(player.getUUID(), session);
             }
             playerLocks.remove(player.getUUID());
+            recoverySessionTokens.remove(player.getUUID());
             quarantinedPlayers.remove(player.getUUID());
         }
     }
@@ -231,9 +404,11 @@ public final class InventoryIsolationService implements AutoCloseable {
 
     private void checkpoint(ServerPlayer player, String reason, boolean asynchronous) throws TransitionException {
         requireServerThread();
+        if (recoveryCheckpoints.contains(player.getUUID())) return;
         Session session = sessions.get(player.getUUID());
         if (session == null || session.owner() != player) {
-            login(player);
+            throw new TransitionException(
+                    "Refusing SaveToFile checkpoint without a preloaded owned inventory session");
         }
         withPlayerLock(player, () -> {
             reconcile(player, reason + "_reconcile");
@@ -297,6 +472,11 @@ public final class InventoryIsolationService implements AutoCloseable {
                 candidateState.resolver().resolve(world, share);
             }
         }
+        MwiConfig.AdvancementMigration advancementMigration =
+                candidate.model().advancementMigration();
+        details.add("Advancement migration dry-run: aliases="
+                + advancementMigration.aliases().size()
+                + ", criterion scopes=" + advancementMigration.criterionAliases().size());
         return new ReloadReport(players, changedShares, details);
     }
 
@@ -336,10 +516,15 @@ public final class InventoryIsolationService implements AutoCloseable {
             }
             try {
                 recoveryService.recover(
-                        player, revision, session.world(), session.profiles(), session.activeAdapters());
+                        player,
+                        revision,
+                        session.world(),
+                        session.profiles(),
+                        session.activeAdapters(),
+                        state.config().model().advancementMigration());
             } catch (RevisionRecoveryService.RecoveryException failure) {
                 if (failure.unsafe()) {
-                    quarantinedPlayers.add(player.getUUID());
+                    recordQuarantine(player.getUUID());
                 }
                 throw new TransitionException(failure.getMessage(), failure);
             }
@@ -364,6 +549,10 @@ public final class InventoryIsolationService implements AutoCloseable {
         synchronized (dimensionCaptureLatenciesNanos) {
             captures = dimensionCaptureLatenciesNanos.stream().sorted().toList();
         }
+        List<Long> revisionAllocations;
+        synchronized (revisionAllocationLatenciesNanos) {
+            revisionAllocations = revisionAllocationLatenciesNanos.stream().sorted().toList();
+        }
         return new PersistenceMetrics(
                 metrics.queueDepth(),
                 metrics.oldestTaskAge().toMillis(),
@@ -371,12 +560,522 @@ public final class InventoryIsolationService implements AutoCloseable {
                 metrics.p99WriteLatency().toMillis(),
                 metrics.failures(),
                 metrics.coalesced(),
+                metrics.queued(),
+                metrics.rejected(),
+                metrics.activeWorkers(),
+                metrics.p95CommitLatency().toMillis(),
+                metrics.p99CommitLatency().toMillis(),
+                quarantinedPlayers.size(),
+                quarantineEvents.sum(),
+                percentileMillis(revisionAllocations, 0.95),
+                percentileMillis(revisionAllocations, 0.99),
                 percentileMillis(captures, 0.95),
                 percentileMillis(captures, 0.99));
     }
 
     public LoginPerformanceMetrics loginPerformanceMetrics() {
         return loginPerformance.snapshot();
+    }
+
+    public CompatibilityMetrics compatibilityMetrics() {
+        return compatibilityDiagnostics.snapshot();
+    }
+
+    /** Resolves a cached player name without triggering a remote profile lookup. */
+    public UUID resolveKnownPlayerName(String name) throws TransitionException {
+        requireServerThread();
+        String requested = Objects.requireNonNull(name, "name").strip();
+        if (requested.isEmpty()) {
+            throw new IllegalArgumentException("player name must not be blank");
+        }
+        try {
+            LinkedHashSet<UUID> candidates = new LinkedHashSet<>(store.listPlayerProfileIds().playerIds());
+            server.getPlayerList().getPlayers().forEach(player -> candidates.add(player.getUUID()));
+            List<UUID> matches = candidates.stream()
+                    .filter(playerId -> server.getProfileCache().get(playerId)
+                            .map(profile -> profile.getName().equalsIgnoreCase(requested))
+                            .orElse(false))
+                    .toList();
+            if (matches.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Unknown cached player name '" + requested + "'; use a UUID for offline players");
+            }
+            if (matches.size() > 1) {
+                throw new IllegalArgumentException(
+                        "Cached player name '" + requested + "' is ambiguous; use a UUID");
+            }
+            return matches.getFirst();
+        } catch (IOException failure) {
+            throw new TransitionException("Unable to inspect known player profiles", failure);
+        }
+    }
+
+    /** Side-effect-free inspection of every canonical bed-spawn profile for a player. */
+    public BedSpawnRepairReport inspectBedSpawn(UUID playerId) throws TransitionException {
+        requireServerThread();
+        Objects.requireNonNull(playerId, "playerId");
+        try {
+            Map<ProfileKey, StoredProfile> profiles = store.inspectPlayerProfiles(playerId);
+            List<BedSpawnProfileInspection> inspected = inspectBedSpawnProfiles(profiles);
+            return new BedSpawnRepairReport(inspected.size(), inspected.size(), 0, 0L, false, inspected);
+        } catch (IOException | RuntimeException failure) {
+            throw new TransitionException("Unable to inspect bed-spawn profiles for " + playerId, failure);
+        }
+    }
+
+    /** Atomically archives and clears selected canonical bed-spawn profiles for an offline player. */
+    public BedSpawnRepairReport clearBedSpawn(UUID playerId, String scopeSelector) throws TransitionException {
+        requireServerThread();
+        Objects.requireNonNull(playerId, "playerId");
+        String selector = normalizeBedSpawnScopeSelector(scopeSelector);
+        if (server.getPlayerList().getPlayer(playerId) != null || sessions.containsKey(playerId)) {
+            throw new TransitionException(
+                    "Bed-spawn clear requires the player to be offline with its inventory session fully closed");
+        }
+        try {
+            snapshotWriter.flush(playerId);
+            store.invalidatePlayer(playerId);
+            Map<ProfileKey, StoredProfile> profiles = store.inspectPlayerProfiles(playerId);
+            List<BedSpawnProfileInspection> all = inspectBedSpawnProfiles(profiles);
+            List<BedSpawnProfileInspection> selected = all.stream()
+                    .filter(entry -> matchesBedSpawnScope(entry.key(), selector))
+                    .toList();
+            LinkedHashMap<ProfileKey, CompoundTag> writes = new LinkedHashMap<>();
+            List<ProfileArchive> archives = new ArrayList<>();
+            List<TransitionJournal.Change> changes = new ArrayList<>();
+            CompoundTag cleared = RespawnLocationPayload.clearedPayload();
+            for (BedSpawnProfileInspection inspection : selected) {
+                if (!inspection.requiresClear()) {
+                    continue;
+                }
+                StoredProfile original = profiles.get(inspection.key());
+                writes.put(inspection.key(), cleared.copy());
+                CompoundTag details = new CompoundTag();
+                details.putString("scope", inspection.scopeSelector());
+                details.putString("game_mode", inspection.key().gameMode().name().toLowerCase(java.util.Locale.ROOT));
+                details.putLong("profile_revision", original.revision());
+                inspection.dimension().ifPresent(value -> details.putString("dimension", value));
+                inspection.validationError().ifPresent(value -> details.putString("validation_error", value));
+                archives.add(new ProfileArchive(
+                        inspection.key(), "bed_spawn", "operator cleared bed-spawn profile", details));
+                changes.add(new TransitionJournal.Change(
+                        AdapterIds.BED_SPAWN.getPath(), inspection.key(), inspection.key(),
+                        original.payload(), cleared));
+            }
+            if (writes.isEmpty()) {
+                return new BedSpawnRepairReport(all.size(), selected.size(), 0, 0L, false, selected);
+            }
+
+            long revision = store.nextRevision(playerId);
+            CompoundTag journal = TransitionJournal.prepared(
+                    "offline_bed_spawn_clear", "offline", selector, changes);
+            TransitionJournal.complete(journal, "committed", changes, null);
+            store.commitBatch(playerId, revision, writes, Optional.of(journal), archives);
+            store.invalidatePlayer(playerId);
+            snapshotWriter.reloadWorkingSetIfLoaded(playerId);
+            return new BedSpawnRepairReport(
+                    all.size(), selected.size(), writes.size(), revision, true, selected);
+        } catch (IOException | RuntimeException failure) {
+            if (hasPendingCommit(failure)) {
+                store.markUncleanShutdown();
+            }
+            throw new TransitionException("Unable to clear bed-spawn profiles for " + playerId, failure);
+        }
+    }
+
+    private List<BedSpawnProfileInspection> inspectBedSpawnProfiles(Map<ProfileKey, StoredProfile> profiles) {
+        return profiles.entrySet().stream()
+                .filter(entry -> entry.getKey().shareId().equals(AdapterIds.BED_SPAWN.getPath()))
+                .sorted(Map.Entry.comparingByKey(java.util.Comparator.comparing(ProfileKey::toString)))
+                .map(entry -> inspectBedSpawnProfile(entry.getKey(), entry.getValue()))
+                .toList();
+    }
+
+    private BedSpawnProfileInspection inspectBedSpawnProfile(ProfileKey key, StoredProfile profile) {
+        CompoundTag raw = profile.payload();
+        Optional<String> storedDimension = raw.contains("dimension", Tag.TAG_STRING)
+                && !raw.getString("dimension").isBlank()
+                ? Optional.of(raw.getString("dimension"))
+                : Optional.empty();
+        Optional<ResourceKey<Level>> storedDimensionKey = storedDimension.flatMap(value -> {
+            try {
+                return Optional.of(ResourceKey.create(Registries.DIMENSION, ResourceLocation.parse(value)));
+            } catch (RuntimeException invalid) {
+                return Optional.empty();
+            }
+        });
+        Optional<Boolean> storedDimensionLoaded = storedDimensionKey
+                .map(dimension -> server.getLevel(dimension) != null);
+        try {
+            RespawnLocationPayload payload = RespawnLocationPayload.decode(raw);
+            Optional<String> dimension = payload.target()
+                    .map(target -> target.dimension().location().toString());
+            Optional<Boolean> loaded = payload.present() ? storedDimensionLoaded : Optional.empty();
+            return new BedSpawnProfileInspection(
+                    key, profile.revision(), payload.present(), dimension, loaded, Optional.empty());
+        } catch (RuntimeException invalid) {
+            return new BedSpawnProfileInspection(
+                    key, profile.revision(), false, storedDimension, storedDimensionLoaded,
+                    Optional.of(meaningfulMessage(invalid)));
+        }
+    }
+
+    private static String normalizeBedSpawnScopeSelector(String scopeSelector) {
+        String selector = Objects.requireNonNull(scopeSelector, "scopeSelector").strip();
+        if (selector.equalsIgnoreCase("all")) {
+            return "all";
+        }
+        int separator = selector.indexOf(':');
+        if (separator <= 0 || separator == selector.length() - 1) {
+            throw new IllegalArgumentException(
+                    "scope must be all, world:<id>, group:<id>, or global:global");
+        }
+        String type = selector.substring(0, separator).toLowerCase(java.util.Locale.ROOT);
+        if (!Set.of("world", "group", "global").contains(type)) {
+            throw new IllegalArgumentException(
+                    "scope must be all, world:<id>, group:<id>, or global:global");
+        }
+        String id = selector.substring(separator + 1);
+        if (type.equals("global") && !id.equals(ScopeKey.GLOBAL_ID)) {
+            throw new IllegalArgumentException("global scope must be global:global");
+        }
+        return type + ':' + id;
+    }
+
+    private static boolean matchesBedSpawnScope(ProfileKey key, String selector) {
+        return selector.equals("all") || bedSpawnScopeSelector(key).equals(selector);
+    }
+
+    private static String bedSpawnScopeSelector(ProfileKey key) {
+        return key.scope().type().name().toLowerCase(java.util.Locale.ROOT) + ':' + key.scope().id();
+    }
+
+    /** Scans or atomically repairs every stored advancement profile for an online or offline player. */
+    public AdvancementRepairReport repairAdvancements(UUID playerId, boolean apply) throws TransitionException {
+        requireServerThread();
+        Objects.requireNonNull(playerId, "playerId");
+        try {
+            if (apply) {
+                snapshotWriter.flush(playerId);
+            }
+            Map<ProfileKey, StoredProfile> profiles = store.inspectPlayerProfiles(playerId);
+            SharableAdapter configured = adapters.require(AdapterIds.ADVANCEMENTS);
+            if (!(configured instanceof AdvancementAdapter advancementAdapter)) {
+                throw new IllegalStateException("The configured advancements adapter cannot repair advancements");
+            }
+
+            LinkedHashMap<ProfileKey, CompoundTag> writes = new LinkedHashMap<>();
+            LinkedHashMap<ProfileKey, StoredProfile> originals = new LinkedHashMap<>();
+            List<String> errors = new ArrayList<>();
+            int scanned = 0;
+            int aliasesMigrated = 0;
+            int criteriaAliasesMigrated = 0;
+            int staleAdvancements = 0;
+            int staleCriteria = 0;
+            for (Map.Entry<ProfileKey, StoredProfile> entry : profiles.entrySet().stream()
+                    .filter(entry -> entry.getKey().shareId().equals(AdapterIds.ADVANCEMENTS.getPath()))
+                    .sorted(Map.Entry.comparingByKey(java.util.Comparator.comparing(ProfileKey::toString)))
+                    .toList()) {
+                scanned++;
+                try {
+                    AdvancementPreparation preparation = advancementAdapter.prepare(
+                            server.getAdvancements(),
+                            entry.getValue().payload(),
+                            state.config().model().advancementMigration());
+                    AdvancementCompatibilityReport report = preparation.report();
+                    aliasesMigrated += report.advancementAliasesMigrated();
+                    criteriaAliasesMigrated += report.criterionAliasesMigrated();
+                    staleAdvancements += report.staleAdvancementsSkipped();
+                    staleCriteria += report.staleCriteriaSkipped();
+                    if (report.changed()) {
+                        writes.put(entry.getKey(), preparation.payload());
+                        originals.put(entry.getKey(), entry.getValue());
+                    }
+                } catch (RuntimeException corrupt) {
+                    errors.add(entry.getKey() + ": " + meaningfulMessage(corrupt));
+                }
+            }
+
+            if (!apply || writes.isEmpty() || !errors.isEmpty()) {
+                return new AdvancementRepairReport(
+                        scanned, writes.size(), aliasesMigrated, criteriaAliasesMigrated,
+                        staleAdvancements, staleCriteria, 0L, false, errors);
+            }
+
+            long revision = store.nextRevision(playerId);
+            List<TransitionJournal.Change> changes = new ArrayList<>();
+            for (Map.Entry<ProfileKey, CompoundTag> write : writes.entrySet()) {
+                StoredProfile original = originals.get(write.getKey());
+                AdvancementPreparation preparation = advancementAdapter.prepare(
+                        server.getAdvancements(),
+                        original.payload(),
+                        state.config().model().advancementMigration());
+                store.archive(
+                        write.getKey(), "compatibility", compatibilityReason(preparation.report()), revision);
+                changes.add(new TransitionJournal.Change(
+                        AdapterIds.ADVANCEMENTS.getPath(), write.getKey(), write.getKey(),
+                        original.payload(), write.getValue()));
+            }
+            CompoundTag journal = TransitionJournal.prepared(
+                    "offline_advancement_repair", "offline", "offline", changes);
+            TransitionJournal.complete(journal, "committed", changes, null);
+            store.commitBatch(playerId, revision, writes, Optional.of(journal));
+            store.invalidatePlayer(playerId);
+            snapshotWriter.refreshWorkingSetIfLoaded(playerId, revision, writes);
+            return new AdvancementRepairReport(
+                    scanned, writes.size(), aliasesMigrated, criteriaAliasesMigrated,
+                    staleAdvancements, staleCriteria, revision, true, errors);
+        } catch (IOException | RuntimeException failure) {
+            if (hasPendingCommit(failure)) {
+                ServerPlayer online = server.getPlayerList().getPlayer(playerId);
+                if (online == null) {
+                    store.markUncleanShutdown();
+                } else {
+                    quarantine(online, failure);
+                }
+            }
+            throw new TransitionException("Unable to repair advancement profiles for " + playerId, failure);
+        }
+    }
+
+    /** Side-effect-free scan or atomic offline repair for every item-bearing canonical profile. */
+    public MissingItemRepairReport repairMissingItems(UUID playerId, boolean apply) throws TransitionException {
+        requireServerThread();
+        Objects.requireNonNull(playerId, "playerId");
+        try {
+            if (apply) {
+                snapshotWriter.flush(playerId);
+            }
+            Map<ProfileKey, StoredProfile> profiles = store.inspectPlayerProfiles(playerId);
+            LinkedHashMap<ProfileKey, CompoundTag> writes = new LinkedHashMap<>();
+            List<ProfileArchive> archives = new ArrayList<>();
+            List<TransitionJournal.Change> changes = new ArrayList<>();
+            List<String> errors = new ArrayList<>();
+            Map<String, Integer> byNamespace = new java.util.TreeMap<>();
+            Map<String, Integer> byShare = new java.util.TreeMap<>();
+            int scanned = 0;
+            int quarantined = 0;
+            int missingItems = 0;
+            int missingComponents = 0;
+            int aliases = 0;
+            for (Map.Entry<ProfileKey, StoredProfile> entry : profiles.entrySet().stream()
+                    .filter(candidate -> ItemProfileCompatibility.supports(candidate.getKey().shareId()))
+                    .sorted(Map.Entry.comparingByKey(java.util.Comparator.comparing(ProfileKey::toString)))
+                    .toList()) {
+                scanned++;
+                try {
+                    ItemPayloadPreparation preparation = ItemProfileCompatibility.prepare(
+                            entry.getKey().shareId(), entry.getValue().payload(), server.registryAccess(),
+                            state.config().model().itemMigration());
+                    ItemCompatibilityReport report = preparation.report();
+                    quarantined += report.issues().size();
+                    missingItems += Math.toIntExact(report.missingItems());
+                    missingComponents += Math.toIntExact(report.missingComponents());
+                    aliases += report.aliasesApplied();
+                    report.issues().forEach(issue -> {
+                        String namespace = issue.itemId() == null ? "unknown" : issue.itemId().getNamespace();
+                        byNamespace.merge(namespace, 1, Integer::sum);
+                        byShare.merge(entry.getKey().shareId(), 1, Integer::sum);
+                    });
+                    if (report.changed()) {
+                        writes.put(entry.getKey(), preparation.payload());
+                        archives.add(new ProfileArchive(
+                                entry.getKey(), "missing_items", itemCompatibilityReason(report),
+                                itemArchiveDetails(
+                                        entry.getKey(), entry.getValue(), report,
+                                        server.getServerVersion(), runtimeModVersion())));
+                        changes.add(new TransitionJournal.Change(
+                                entry.getKey().shareId(), entry.getKey(), entry.getKey(),
+                                entry.getValue().payload(), preparation.payload()));
+                    }
+                } catch (RuntimeException corrupt) {
+                    errors.add(entry.getKey() + ": " + meaningfulMessage(corrupt));
+                }
+            }
+            if (!apply || writes.isEmpty() || !errors.isEmpty()) {
+                return new MissingItemRepairReport(
+                        scanned, writes.size(), quarantined, missingItems, missingComponents, aliases,
+                        0L, false, byNamespace, byShare, errors);
+            }
+
+            long revision = store.nextRevision(playerId);
+            CompoundTag journal = TransitionJournal.prepared(
+                    "offline_missing_item_repair", "offline", "offline", changes);
+            TransitionJournal.complete(journal, "committed", changes, null);
+            store.commitBatch(playerId, revision, writes, Optional.of(journal), archives);
+            store.invalidatePlayer(playerId);
+            snapshotWriter.refreshWorkingSetIfLoaded(playerId, revision, writes);
+            return new MissingItemRepairReport(
+                    scanned, writes.size(), quarantined, missingItems, missingComponents, aliases,
+                    revision, true, byNamespace, byShare, errors);
+        } catch (IOException | RuntimeException failure) {
+            compatibilityDiagnostics.missingItemRepairFailures.increment();
+            if (hasPendingCommit(failure)) {
+                ServerPlayer online = server.getPlayerList().getPlayer(playerId);
+                if (online == null) {
+                    store.markUncleanShutdown();
+                } else {
+                    quarantine(online, failure);
+                }
+            }
+            throw new TransitionException("Unable to repair missing items for " + playerId, failure);
+        }
+    }
+
+    public MissingItemBatchRepairReport repairMissingItemsAll(boolean apply) throws TransitionException {
+        requireServerThread();
+        final int maxPlayers = 32;
+        final long deadline = System.nanoTime() + java.time.Duration.ofMillis(100).toNanos();
+        try {
+            PlayerProfileIds available = store.listPlayerProfileIds();
+            int availableCount = available.playerIds().size();
+            int start = availableCount == 0
+                    ? 0
+                    : Math.floorMod((int) missingItemBatchCursor.get(), availableCount);
+            int processed = 0;
+            int scannedProfiles = 0;
+            int modifiedProfiles = 0;
+            int quarantinedStacks = 0;
+            int appliedPlayers = 0;
+            List<String> errors = new ArrayList<>();
+            while (processed < availableCount) {
+                if (processed >= maxPlayers || System.nanoTime() >= deadline) {
+                    break;
+                }
+                UUID playerId = available.playerIds().get((start + processed) % availableCount);
+                processed++;
+                try {
+                    MissingItemRepairReport report = repairMissingItems(playerId, apply);
+                    scannedProfiles += report.scannedProfiles();
+                    modifiedProfiles += report.modifiedProfiles();
+                    quarantinedStacks += report.quarantinedStacks();
+                    if (report.applied()) {
+                        appliedPlayers++;
+                    }
+                    report.errors().forEach(error -> errors.add(playerId + ": " + error));
+                } catch (TransitionException failure) {
+                    errors.add(playerId + ": " + meaningfulMessage(failure));
+                }
+            }
+            if (availableCount > 0) {
+                missingItemBatchCursor.set((start + processed) % availableCount);
+            }
+            return new MissingItemBatchRepairReport(
+                    availableCount, processed, scannedProfiles, modifiedProfiles,
+                    quarantinedStacks, appliedPlayers,
+                    processed < availableCount, errors);
+        } catch (IOException failure) {
+            throw new TransitionException("Unable to enumerate canonical player profiles", failure);
+        }
+    }
+
+    public List<MissingItemArchiveSummary> listMissingItemArchives(UUID playerId) throws TransitionException {
+        requireServerThread();
+        try {
+            return store.listCompatibilityArchives(playerId).stream().map(entry -> {
+                CompoundTag issue = entry.issue();
+                return new MissingItemArchiveSummary(
+                        entry.entryId(), entry.sourceKey(), entry.archiveRevision(),
+                        issue.getString("logical_slot"), issue.getString("reason"), issue.getString("item_id"));
+            }).toList();
+        } catch (IOException | RuntimeException failure) {
+            throw new TransitionException("Unable to list missing-item archives for " + playerId, failure);
+        }
+    }
+
+    public MissingItemRestoreReport restoreMissingItem(UUID playerId, String entryId)
+            throws TransitionException {
+        requireServerThread();
+        Objects.requireNonNull(playerId, "playerId");
+        Objects.requireNonNull(entryId, "entryId");
+        try {
+            snapshotWriter.flush(playerId);
+            CompatibilityArchiveEntry archive = store.listCompatibilityArchives(playerId).stream()
+                    .filter(candidate -> candidate.entryId().equals(entryId))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException("Unknown compatibility archive entry " + entryId));
+            CompoundTag issue = archive.issue();
+            if (!(issue.get("original_stack") instanceof CompoundTag originalStack) || originalStack.isEmpty()) {
+                throw new IllegalArgumentException("Archive entry has no original stack");
+            }
+            ProfileKey key = archive.sourceKey();
+            StoredProfile current = store.load(key).orElseThrow(
+                    () -> new IllegalArgumentException("Canonical target profile no longer exists: " + key));
+            CompoundTag restored = ItemProfileCompatibility.restoreStack(
+                    key.shareId(), current.payload(), issue.getString("logical_slot"), originalStack,
+                    server.registryAccess(), state.config().model().itemMigration());
+            long revision = store.nextRevision(playerId);
+            List<TransitionJournal.Change> changes = List.of(new TransitionJournal.Change(
+                    key.shareId(), key, key, current.payload(), restored));
+            CompoundTag journal = TransitionJournal.prepared(
+                    "restore_missing_item_" + entryId, "offline", "offline", changes);
+
+            ServerPlayer online = server.getPlayerList().getPlayer(playerId);
+            LinkedHashMap<SharableAdapter, CompoundTag> liveBefore = new LinkedHashMap<>();
+            SharableAdapter activeAdapter = null;
+            if (online != null) {
+                Session session = sessions.get(playerId);
+                if (session != null && session.owner() == online
+                        && key.equals(session.profiles().get(key.shareId()))) {
+                    activeAdapter = session.activeAdapters().get(key.shareId());
+                    if (activeAdapter != null) {
+                        liveBefore.put(activeAdapter, activeAdapter.capture(online, online.registryAccess()));
+                        SharableAdapter selected = activeAdapter;
+                        replace(online, List.of(selected), () -> {
+                            selected.clear(online);
+                            selected.apply(online, restored, online.registryAccess());
+                        });
+                    }
+                }
+            }
+            try {
+                TransitionJournal.complete(journal, "committed", changes, null);
+                store.commitBatch(playerId, revision, Map.of(key, restored), Optional.of(journal));
+            } catch (IOException | RuntimeException failure) {
+                if (online != null && !liveBefore.isEmpty() && !hasPendingCommit(failure)) {
+                    rollback(online, liveBefore);
+                }
+                throw failure;
+            }
+            store.invalidatePlayer(playerId);
+            snapshotWriter.refreshWorkingSetIfLoaded(playerId, revision, Map.of(key, restored));
+            return new MissingItemRestoreReport(entryId, key, issue.getString("logical_slot"), revision);
+        } catch (IOException | RuntimeException failure) {
+            if (hasPendingCommit(failure)) {
+                ServerPlayer online = server.getPlayerList().getPlayer(playerId);
+                if (online == null) {
+                    store.markUncleanShutdown();
+                } else {
+                    quarantine(online, failure);
+                }
+            }
+            throw new TransitionException("Unable to restore missing-item archive " + entryId, failure);
+        }
+    }
+
+    /** Flushes pending writes, then removes every disk-profile cache entry for a player. */
+    public int invalidatePlayerCache(UUID playerId) throws TransitionException {
+        requireServerThread();
+        Objects.requireNonNull(playerId, "playerId");
+        try {
+            snapshotWriter.flush(playerId);
+            int before = store.cacheStats().entries();
+            store.invalidatePlayer(playerId);
+            snapshotWriter.reloadWorkingSetIfLoaded(playerId);
+            return Math.max(0, before - store.cacheStats().entries());
+        } catch (IOException failure) {
+            throw new TransitionException("Unable to invalidate profile cache for " + playerId, failure);
+        }
+    }
+
+    private static String meaningfulMessage(Throwable failure) {
+        Throwable current = failure;
+        while ((current.getMessage() == null || current.getMessage().isBlank())
+                && current.getCause() != null) {
+            current = current.getCause();
+        }
+        String message = current.getMessage();
+        return message == null || message.isBlank() ? current.getClass().getSimpleName() : message;
     }
 
     private void recordDimensionCapture(long elapsedNanos) {
@@ -497,7 +1196,7 @@ public final class InventoryIsolationService implements AutoCloseable {
                         rollback(player, before);
                     } catch (RuntimeException rollbackFailure) {
                         failure.addSuppressed(rollbackFailure);
-                        quarantinedPlayers.add(player.getUUID());
+                        recordQuarantine(player.getUUID());
                     }
                     throw new TransitionException("Unable to apply the edited inventory live", failure);
                 }
@@ -516,11 +1215,11 @@ public final class InventoryIsolationService implements AutoCloseable {
                         rollback(player, before);
                     } catch (RuntimeException rollbackFailure) {
                         failure.addSuppressed(rollbackFailure);
-                        quarantinedPlayers.add(player.getUUID());
+                        recordQuarantine(player.getUUID());
                     }
                 }
                 if (durablePendingCommit) {
-                    quarantinedPlayers.add(player.getUUID());
+                    recordQuarantine(player.getUUID());
                     logger.error("Inventory editor commit is durable but pending for {} ({})",
                             player.getGameProfile().getName(), player.getUUID(), failure);
                     player.connection.disconnect(Component.literal(
@@ -583,12 +1282,18 @@ public final class InventoryIsolationService implements AutoCloseable {
     }
 
     public void quarantine(ServerPlayer player, Throwable failure) {
-        quarantinedPlayers.add(player.getUUID());
+        recordQuarantine(player.getUUID());
         store.markUncleanShutdown();
         logger.error("Inventory transaction failed for {} ({})", player.getGameProfile().getName(), player.getUUID(), failure);
         player.connection.disconnect(Component.literal(
                 "Yu Multiverse Inventory could not safely switch your profile. Canonical profile writes are now "
                         + "blocked; contact an administrator before reconnecting."));
+    }
+
+    private void recordQuarantine(UUID playerId) {
+        if (quarantinedPlayers.add(playerId)) {
+            quarantineEvents.increment();
+        }
     }
 
     @Override
@@ -600,7 +1305,15 @@ public final class InventoryIsolationService implements AutoCloseable {
                 if (quarantinedPlayers.contains(player.getUUID())) {
                     persistQuarantined(player, "server stop while player was quarantined");
                 } else {
-                    persistCurrent(player, "server_stop", true);
+                    withPlayerLock(player, () -> {
+                        Session session = sessions.get(player.getUUID());
+                        if (session == null || session.owner() != player) {
+                            persistQuarantined(player, "server stop without an owned inventory session");
+                            return;
+                        }
+                        reconcile(player, "server_stop_reconcile");
+                        persistCurrent(player, "server_stop", true);
+                    });
                 }
             } catch (TransitionException failure) {
                 clean = false;
@@ -635,6 +1348,209 @@ public final class InventoryIsolationService implements AutoCloseable {
         }
     }
 
+    /**
+     * Establishes the source-side working session for hybrid servers that synchronously teleport a
+     * player from a Bukkit join handler before NeoForge publishes PlayerLoggedInEvent.
+     */
+    private void bootstrapProvisionalSession(
+            ServerPlayer player,
+            ResourceKey<Level> fromDimension,
+            ResourceKey<Level> toDimension) throws TransitionException {
+        try {
+            snapshotWriter.preload(player.getUUID());
+        } catch (IOException failure) {
+            throw new TransitionException("Unable to preload player profiles for pre-login transition", failure);
+        }
+
+        State current = state;
+        WorldIdentity sourceWorld = WorldIdentities.from(fromDimension);
+        Map<String, SharableAdapter> activeAdapters = activeAdapters(player, current);
+        Map<String, ProfileKey> sourceKeys = profileKeys(player, sourceWorld, current, activeAdapters);
+        Session provisional = new Session(
+                player,
+                fromDimension,
+                sourceWorld,
+                gameMode(player, current.config()),
+                sourceKeys,
+                activeAdapters,
+                current.generation(),
+                LocationTracker.unknown(),
+                SessionPhase.PROVISIONAL);
+        sessions.put(player.getUUID(), provisional);
+        restoreCanonicalProvisionalSource(player, provisional);
+        logPreLoginTransition(player, fromDimension, toDimension, provisional, "bootstrap");
+        reconcile(player, toDimension, "pre_login_dimension_change");
+    }
+
+    /**
+     * Establishes source-profile ownership before a hybrid pre-login teleport is reconciled. The
+     * ServerPlayer snapshot present at this point was loaded by vanilla and has no trustworthy MWI
+     * scope provenance. Existing canonical source profiles therefore win even after an otherwise
+     * clean shutdown. If the source profile is missing while the same share exists in another MWI
+     * scope, the source is reset instead of copying foreign live state into that scope.
+     */
+    private void restoreCanonicalProvisionalSource(ServerPlayer player, Session provisional)
+            throws TransitionException {
+        LinkedHashMap<SharableAdapter, CompoundTag> rollbackSnapshots = new LinkedHashMap<>();
+        LinkedHashMap<SharableAdapter, CompoundTag> canonical = new LinkedHashMap<>();
+        LinkedHashSet<SharableAdapter> resets = new LinkedHashSet<>();
+        LinkedHashMap<ProfileKey, CompoundTag> compatibilityWrites = new LinkedHashMap<>();
+        List<ArchiveRequest> compatibilityArchives = new ArrayList<>();
+        for (Map.Entry<String, SharableAdapter> entry : provisional.activeAdapters().entrySet()) {
+            if (entry.getKey().equals(AdapterIds.LAST_LOCATION.getPath())) {
+                continue;
+            }
+            SharableAdapter adapter = entry.getValue();
+            CompoundTag live = adapter.capture(player, player.registryAccess());
+            rollbackSnapshots.put(adapter, live);
+            ProfileKey sourceKey = provisional.profiles().get(entry.getKey());
+            if (store.shouldResetLive(sourceKey)) {
+                resets.add(adapter);
+                continue;
+            }
+            Optional<StoredProfile> stored = snapshotWriter.load(sourceKey);
+            if (stored.isPresent()) {
+                CompoundTag payload = prepareStoredPayload(
+                        player, adapter, sourceKey, stored.orElseThrow(), compatibilityArchives);
+                if (!adapter.equivalent(payload, stored.orElseThrow().payload())) {
+                    compatibilityWrites.put(sourceKey, payload);
+                }
+                if (!adapter.equivalent(payload, live)) {
+                    canonical.put(adapter, payload);
+                }
+            } else if (!LoginStateOwnershipPolicy.mayBootstrapUnknownLive(
+                    snapshotWriter.hasAnyProfileForShare(player.getUUID(), entry.getKey()))) {
+                // The live snapshot demonstrably cannot be the first MWI-owned value for this share,
+                // but there is no canonical value for the event's source scope. Treat the new scope as
+                // empty/default rather than copying a value owned by an unknown/foreign scope.
+                resets.add(adapter);
+                logger.warn(
+                        "Pre-login source profile is missing but the share has canonical history: "
+                                + "player={}/{} share={} source={} action=reset_default",
+                        player.getGameProfile().getName(),
+                        player.getUUID(),
+                        entry.getKey(),
+                        sourceKey);
+            }
+        }
+        if (!compatibilityArchives.isEmpty()) {
+            try {
+                long revision = nextRevision(player);
+                snapshotWriter.commitImmediately(
+                        player.getUUID(), revision, compatibilityWrites, Optional.empty(),
+                        compatibilityArchives.stream().map(ArchiveRequest::toStoreArchive).toList());
+            } catch (IOException failure) {
+                throw new TransitionException(
+                        "Unable to archive compatibility-degraded canonical profiles", failure);
+            }
+        }
+        if (canonical.isEmpty() && resets.isEmpty()) {
+            return;
+        }
+
+        LinkedHashSet<SharableAdapter> mutations = new LinkedHashSet<>(resets);
+        mutations.addAll(canonical.keySet());
+        try {
+            replace(player, mutations, () -> {
+                for (SharableAdapter adapter : mutations) {
+                    adapter.clear(player);
+                    CompoundTag payload = canonical.get(adapter);
+                    if (payload != null) {
+                        adapter.apply(player, payload, player.registryAccess());
+                    }
+                }
+            });
+        } catch (RuntimeException failure) {
+            try {
+                rollback(player, rollbackSnapshots);
+            } catch (RuntimeException rollbackFailure) {
+                failure.addSuppressed(rollbackFailure);
+            }
+            throw new TransitionException("Unable to establish canonical pre-login source profiles", failure);
+        }
+        logger.info(
+                "Established pre-login source ownership: player={}/{} world={} restoredCanonical={} "
+                        + "resetUnknownScope={} startupRollbackRecovery={}",
+                player.getGameProfile().getName(),
+                player.getUUID(),
+                provisional.world().name(),
+                canonical.size(),
+                resets.size(),
+                store.requiresCanonicalRecovery(player.getUUID()));
+    }
+
+    /** Promotes a successfully reconciled provisional session without applying any profile twice. */
+    private void completeProvisionalLogin(ServerPlayer player) throws TransitionException {
+        Session provisional = sessions.get(player.getUUID());
+        if (provisional == null || provisional.owner() != player) {
+            initialize(player);
+            return;
+        }
+        if (provisional.phase() == SessionPhase.ACTIVE) {
+            return;
+        }
+
+        State current = state;
+        ResourceKey<Level> liveDimension = player.serverLevel().dimension();
+        WorldIdentity liveWorld = WorldIdentities.from(liveDimension);
+        GameModeBucket liveGameMode = gameMode(player, current.config());
+        if (!provisional.dimension().equals(liveDimension)
+                || !provisional.world().equals(liveWorld)
+                || provisional.gameMode() != liveGameMode
+                || provisional.configGeneration() != current.generation()) {
+            reconcile(player, liveDimension, "pre_login_finalize");
+            provisional = sessions.get(player.getUUID());
+        }
+        if (provisional == null || provisional.owner() != player) {
+            throw new TransitionException("Provisional inventory session disappeared before login completion");
+        }
+
+        sessions.put(player.getUUID(), provisional.activate());
+        loginPerformance.recordLogin();
+        store.completeStartupRecovery(player.getUUID());
+        logger.info(
+                "Pre-login inventory session activated: player={}/{} world={} dimension={} action=promote",
+                player.getGameProfile().getName(),
+                player.getUUID(),
+                provisional.world().name(),
+                provisional.dimension().location());
+    }
+
+    private void logPreLoginTransition(
+            ServerPlayer player,
+            ResourceKey<Level> fromDimension,
+            ResourceKey<Level> toDimension,
+            Session session,
+            String action) {
+        WorldIdentity fromWorld = WorldIdentities.from(fromDimension);
+        WorldIdentity toWorld = WorldIdentities.from(toDimension);
+        logger.info(
+                "Pre-login dimension transition detected: player={}/{} from={}/{}/{} to={}/{}/{} "
+                        + "sessionState={} action={}",
+                player.getGameProfile().getName(),
+                player.getUUID(),
+                fromDimension.location(),
+                fromWorld.name(),
+                profileScopeSummary(player, fromWorld, session.activeAdapters()),
+                toDimension.location(),
+                toWorld.name(),
+                profileScopeSummary(player, toWorld, session.activeAdapters()),
+                session.phase().logName(),
+                action);
+    }
+
+    private String profileScopeSummary(
+            ServerPlayer player,
+            WorldIdentity world,
+            Map<String, SharableAdapter> activeAdapters) {
+        return profileKeys(player, world, state, activeAdapters).values().stream()
+                .map(key -> key.scope().type().name().toLowerCase(java.util.Locale.ROOT)
+                        + ":" + key.scope().id())
+                .distinct()
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(",", "[", "]"));
+    }
+
     private void initialize(ServerPlayer player) throws TransitionException {
         loginPerformance.recordLogin();
         try {
@@ -660,14 +1576,19 @@ public final class InventoryIsolationService implements AutoCloseable {
         }
         long revision = nextRevision(player);
         List<TransitionJournal.Change> changes = new ArrayList<>();
+        LinkedHashMap<ProfileKey, CompoundTag> canonicalBefore = new LinkedHashMap<>();
         Map<String, CompoundTag> incoming = new HashMap<>();
         LinkedHashMap<ProfileKey, CompoundTag> writes = new LinkedHashMap<>();
         List<ArchiveRequest> archives = new ArrayList<>();
         CompoundTag journal = null;
-        boolean firstCrashRecovery = crashRecoveredPlayers.add(player.getUUID());
-        boolean recoverLive = store.recoveredFromUncleanShutdown()
-                && firstCrashRecovery
-                && !store.requiresCanonicalRecovery(player.getUUID());
+        LinkedHashSet<SharableAdapter> resetToDefault = new LinkedHashSet<>();
+        if (store.recoveredFromUncleanShutdown()) {
+            logger.warn(
+                    "Initializing {} ({}) after an unclean shutdown: login live state is rollback-only; "
+                            + "existing canonical profiles remain authoritative",
+                    player.getGameProfile().getName(),
+                    player.getUUID());
+        }
 
         try {
             for (Map.Entry<String, SharableAdapter> entry : activeAdapters.entrySet()) {
@@ -676,42 +1597,76 @@ public final class InventoryIsolationService implements AutoCloseable {
                 ProfileKey target = targetKeys.get(share);
                 CompoundTag livePayload = live.get(adapter);
                 Optional<StoredProfile> stored = snapshotWriter.load(target);
-                CompoundTag selected;
-                if (recoverLive) {
-                    if (stored.isPresent()) {
-                        archives.add(new ArchiveRequest(target, "crash_recovery", "unclean server shutdown"));
+                if (stored.isPresent()) {
+                    StoredProfile canonicalProfile = stored.orElseThrow();
+                    canonicalBefore.put(target, canonicalProfile.payload());
+                    CompoundTag selected = prepareStoredPayload(
+                            player, adapter, target, canonicalProfile, archives);
+                    incoming.put(share, selected);
+                    if (!adapter.equivalent(selected, canonicalProfile.payload())) {
+                        writes.put(target, selected);
                     }
-                    selected = livePayload;
-                    writes.put(target, selected);
-                } else if (stored.isPresent()) {
-                    selected = stored.get().payload();
-                    incoming.put(share, selected);
                 } else if (target.scope().type() == ScopeKey.Type.GROUP) {
-                    selected = migrateGroupTarget(
-                            player, world, target, livePayload, true, writes, archives);
-                    incoming.put(share, selected);
+                    boolean allowFirstProfileBootstrap = LoginStateOwnershipPolicy.mayBootstrapUnknownLive(
+                            snapshotWriter.hasAnyProfileForShare(player.getUUID(), share));
+                    CompoundTag selected = migrateGroupTarget(
+                            player, world, target, livePayload, allowFirstProfileBootstrap, writes, archives);
+                    if (selected != null) {
+                        incoming.put(share, selected);
+                    } else {
+                        resetToDefault.add(adapter);
+                        logger.warn(
+                                "Refusing unknown login live state as canonical: player={}/{} share={} "
+                                        + "target={} action=reset_default reason=existing_share_history",
+                                player.getGameProfile().getName(),
+                                player.getUUID(),
+                                share,
+                                target);
+                    }
+                } else if (LoginStateOwnershipPolicy.mayBootstrapUnknownLive(
+                        snapshotWriter.hasAnyProfileForShare(player.getUUID(), share))) {
+                    // The first persisted profile for a share may adopt the vanilla login state. Once any
+                    // MWI profile exists for that share, an unowned login snapshot can no longer prove
+                    // which scope it belongs to and must never seed another scope.
+                    writes.put(target, livePayload);
+                    logger.info(
+                            "Bootstrapping first MWI profile for share from vanilla login state: "
+                                    + "player={}/{} share={} target={}",
+                            player.getGameProfile().getName(),
+                            player.getUUID(),
+                            share,
+                            target);
                 } else {
-                    selected = livePayload;
-                    writes.put(target, selected);
+                    resetToDefault.add(adapter);
+                    logger.warn(
+                            "Refusing unknown login live state as canonical: player={}/{} share={} "
+                                    + "target={} action=reset_default reason=existing_share_history",
+                            player.getGameProfile().getName(),
+                            player.getUUID(),
+                            share,
+                            target);
                 }
-                changes.add(new TransitionJournal.Change(share, target, target, livePayload, null));
+                changes.add(new TransitionJournal.Change(share, null, target, livePayload, null));
             }
-            journal = TransitionJournal.prepared("login", world.name(), world.name(), changes);
+            journal = TransitionJournal.preparedLogin(world.name(), changes, canonicalBefore);
             store.writeRevision(player.getUUID(), revision, journal);
-
             List<SharableAdapter> mutatedAdapters = new ArrayList<>();
             for (Map.Entry<String, SharableAdapter> entry : activeAdapters.entrySet()) {
                 CompoundTag payload = incoming.get(entry.getKey());
-                if (payload != null && !entry.getValue().equivalent(payload, live.get(entry.getValue()))) {
+                if (resetToDefault.contains(entry.getValue())
+                        || (payload != null && !entry.getValue().equivalent(payload, live.get(entry.getValue())))) {
                     mutatedAdapters.add(entry.getValue());
                 }
             }
             replace(player, mutatedAdapters, () -> {
                 for (Map.Entry<String, SharableAdapter> entry : activeAdapters.entrySet()) {
+                    SharableAdapter adapter = entry.getValue();
                     CompoundTag payload = incoming.get(entry.getKey());
-                    if (payload != null && !entry.getValue().equivalent(payload, live.get(entry.getValue()))) {
-                        entry.getValue().clear(player);
-                        entry.getValue().apply(player, payload, player.registryAccess());
+                    if (resetToDefault.contains(adapter)) {
+                        adapter.clear(player);
+                    } else if (payload != null && !adapter.equivalent(payload, live.get(adapter))) {
+                        adapter.clear(player);
+                        adapter.apply(player, payload, player.registryAccess());
                     }
                 }
             }, loginPerformance::recordReplacement);
@@ -720,8 +1675,11 @@ public final class InventoryIsolationService implements AutoCloseable {
             int finalCaptures = 0;
             try {
                 for (Map.Entry<String, SharableAdapter> entry : activeAdapters.entrySet()) {
-                    currentPayloads.put(
-                            entry.getKey(), entry.getValue().capture(player, player.registryAccess()));
+                    CompoundTag payload = entry.getValue().capture(player, player.registryAccess());
+                    currentPayloads.put(entry.getKey(), payload);
+                    if (resetToDefault.contains(entry.getValue())) {
+                        writes.put(targetKeys.get(entry.getKey()), payload);
+                    }
                     finalCaptures++;
                 }
             } finally {
@@ -734,21 +1692,22 @@ public final class InventoryIsolationService implements AutoCloseable {
 
             List<TransitionJournal.Change> completed = withAfter(changes, currentPayloads);
             TransitionJournal.complete(journal, "committed", completed, null);
-            applyArchives(archives, revision);
-            snapshotWriter.commitImmediately(player.getUUID(), revision, writes, Optional.of(journal));
+            snapshotWriter.commitImmediately(
+                    player.getUUID(), revision, writes, Optional.of(journal),
+                    archives.stream().map(ArchiveRequest::toStoreArchive).toList());
             sessions.put(player.getUUID(), new Session(
                     player, player.serverLevel().dimension(), world, gameMode, targetKeys, activeAdapters,
-                    current.generation(), new LocationTracker(player)));
+                    current.generation(), new LocationTracker(player), SessionPhase.ACTIVE));
             store.completeStartupRecovery(player.getUUID());
         } catch (Exception failure) {
             if (hasPendingCommit(failure)) {
-                quarantinedPlayers.add(player.getUUID());
+                recordQuarantine(player.getUUID());
             } else {
                 try {
                     rollback(player, live);
                 } catch (RuntimeException rollbackFailure) {
                     failure.addSuppressed(rollbackFailure);
-                    quarantinedPlayers.add(player.getUUID());
+                    recordQuarantine(player.getUUID());
                 }
                 if (journal != null) {
                     try {
@@ -775,17 +1734,30 @@ public final class InventoryIsolationService implements AutoCloseable {
     }
 
     private void reconcile(ServerPlayer player, String reason) throws TransitionException {
+        reconcile(player, player.serverLevel().dimension(), reason);
+    }
+
+    private void reconcile(
+            ServerPlayer player,
+            ResourceKey<Level> targetDimension,
+            String reason) throws TransitionException {
         Session session = sessions.get(player.getUUID());
         if (session == null) {
-            if ("dimension_change".equals(reason)) {
-                throw new TransitionException(
-                        "Dimension transition arrived before the player profile working set was initialized");
-            }
             initialize(player);
             return;
         }
+        if (session.owner() != player) {
+            throw new TransitionException("Inventory session belongs to a different player connection");
+        }
+        if (!player.serverLevel().dimension().equals(targetDimension)) {
+            throw new TransitionException(
+                    "Dimension transition target does not match the player's live dimension: event="
+                            + targetDimension.location() + ", live="
+                            + player.serverLevel().dimension().location());
+        }
+
         State current = state;
-        WorldIdentity targetWorld = WorldIdentities.from(player.serverLevel());
+        WorldIdentity targetWorld = WorldIdentities.from(targetDimension);
         GameModeBucket targetGameMode = gameMode(player, current.config());
         Map<String, SharableAdapter> activeAdapters = activeAdapters(player, current);
         Map<String, ProfileKey> targetKeys = profileKeys(player, targetWorld, current, activeAdapters);
@@ -801,39 +1773,60 @@ public final class InventoryIsolationService implements AutoCloseable {
         if (moves.isEmpty()) {
             if (!session.world().equals(targetWorld)
                     && current.config().model().shareHandling().alwaysWriteWorldProfile()) {
-                long revision = nextRevision(player);
                 try {
-                    Map<String, CompoundTag> overrides = Map.of(
-                            "last_location", session.location().toPayload());
+                    Optional<CompoundTag> sourceLocation = session.location().payload();
+                    Map<String, CompoundTag> overrides = sourceLocation
+                            .map(payload -> Map.of(AdapterIds.LAST_LOCATION.getPath(), payload))
+                            .orElseGet(Map::of);
+                    Map<String, SharableAdapter> backupAdapters = sourceLocation.isPresent()
+                            ? activeAdapters
+                            : withoutLastLocation(activeAdapters);
+                    if (sourceLocation.isEmpty()
+                            && activeAdapters.containsKey(AdapterIds.LAST_LOCATION.getPath())) {
+                        logSkippedSourceLocation(player, session.world(), targetWorld);
+                    }
                     LinkedHashMap<ProfileKey, CompoundTag> writes = new LinkedHashMap<>();
                     collectWorldBackups(
-                            player, session.world(), session.profiles(), activeAdapters, overrides, writes);
-                    snapshotWriter.enqueue(
-                            player.getUUID(), revision, writes, Optional.empty(), "world_backup");
+                            player, session.world(), session.profiles(), backupAdapters, overrides, writes);
+                    if (!writes.isEmpty()) {
+                        snapshotWriter.enqueue(
+                                player.getUUID(), nextRevision(player), writes, Optional.empty(), "world_backup");
+                    }
                 } catch (RuntimeException failure) {
                     throw new TransitionException("Unable to write world profile backups", failure);
                 }
             }
             sessions.put(player.getUUID(), new Session(
-                    player, player.serverLevel().dimension(), targetWorld, targetGameMode, targetKeys, activeAdapters,
-                    current.generation(), new LocationTracker(player)));
+                    player, targetDimension, targetWorld, targetGameMode, targetKeys, activeAdapters,
+                    current.generation(), new LocationTracker(player), session.phase()));
             return;
         }
 
         closeMenu(player);
-        LinkedHashMap<SharableAdapter, CompoundTag> before = capture(
+        LinkedHashMap<SharableAdapter, CompoundTag> rollbackSnapshots = capture(
                 player, moves.stream().map(Move::adapter).toList());
+        LinkedHashMap<SharableAdapter, CompoundTag> outgoingSnapshots =
+                new LinkedHashMap<>(rollbackSnapshots);
         if (!session.world().equals(targetWorld)) {
             for (Move move : moves) {
-                if (move.shareId().equals("last_location")) {
-                    before.put(move.adapter(), session.location().toPayload());
+                if (!move.shareId().equals(AdapterIds.LAST_LOCATION.getPath())) {
+                    continue;
+                }
+                Optional<CompoundTag> sourceLocation = session.location().payload();
+                if (sourceLocation.isPresent()) {
+                    outgoingSnapshots.put(move.adapter(), sourceLocation.orElseThrow());
+                } else {
+                    outgoingSnapshots.remove(move.adapter());
+                    logSkippedSourceLocation(player, session.world(), targetWorld);
                 }
             }
         }
         long revision = nextRevision(player);
         List<TransitionJournal.Change> changes = moves.stream()
+                .filter(move -> outgoingSnapshots.containsKey(move.adapter()))
                 .map(move -> new TransitionJournal.Change(
-                        move.shareId(), move.fromKey(), move.toKey(), before.get(move.adapter()), null))
+                        move.shareId(), move.fromKey(), move.toKey(),
+                        outgoingSnapshots.get(move.adapter()), null))
                 .toList();
         CompoundTag journal = TransitionJournal.prepared(
                 reason, session.world().name(), targetWorld.name(), changes);
@@ -844,10 +1837,10 @@ public final class InventoryIsolationService implements AutoCloseable {
 
         try {
             for (Move move : moves) {
-                if (move.fromKey() == null) {
+                if (move.fromKey() == null || !outgoingSnapshots.containsKey(move.adapter())) {
                     continue;
                 }
-                CompoundTag outgoing = before.get(move.adapter());
+                CompoundTag outgoing = outgoingSnapshots.get(move.adapter());
                 writes.put(move.fromKey(), outgoing);
                 if (current.config().model().shareHandling().alwaysWriteWorldProfile()) {
                     ProfileKey worldBackup = new ProfileKey(
@@ -858,11 +1851,17 @@ public final class InventoryIsolationService implements AutoCloseable {
             for (Move move : moves) {
                 Optional<StoredProfile> stored = snapshotWriter.load(move.toKey());
                 if (stored.isPresent()) {
-                    incoming.put(move.shareId(), stored.get().payload());
+                    StoredProfile canonicalProfile = stored.orElseThrow();
+                    incoming.put(move.shareId(), prepareStoredPayload(
+                            player, move.adapter(), move.toKey(), canonicalProfile, archives));
+                    CompoundTag selected = incoming.get(move.shareId());
+                    if (!move.adapter().equivalent(selected, canonicalProfile.payload())) {
+                        writes.put(move.toKey(), selected);
+                    }
                 } else if (move.toKey().scope().type() == ScopeKey.Type.GROUP) {
                     boolean sameWorld = move.fromKey() == null || session.world().equals(targetWorld);
                     CompoundTag migrated = migrateGroupTarget(
-                            player, targetWorld, move.toKey(), before.get(move.adapter()), sameWorld,
+                            player, targetWorld, move.toKey(), rollbackSnapshots.get(move.adapter()), sameWorld,
                             writes, archives);
                     if (migrated != null) {
                         incoming.put(move.shareId(), migrated);
@@ -876,7 +1875,8 @@ public final class InventoryIsolationService implements AutoCloseable {
                 if (move.fromKey() == null && payload == null) {
                     continue;
                 }
-                if (payload != null && move.adapter().equivalent(payload, before.get(move.adapter()))) {
+                if (payload != null
+                        && move.adapter().equivalent(payload, rollbackSnapshots.get(move.adapter()))) {
                     continue;
                 }
                 mutatedMoves.add(move);
@@ -892,6 +1892,14 @@ public final class InventoryIsolationService implements AutoCloseable {
                 }
             });
 
+            WorldIdentity finalWorld = WorldIdentities.from(player.serverLevel());
+            Map<String, ProfileKey> finalKeys = profileKeys(player, finalWorld, current, activeAdapters);
+            if (!targetKeys.equals(finalKeys)) {
+                throw new TransitionException(
+                        "Applied profile moved the player across an inventory scope boundary: target="
+                                + targetWorld.name() + ", final=" + finalWorld.name());
+            }
+
             LinkedHashMap<String, CompoundTag> after = new LinkedHashMap<>();
             for (Move move : moves) {
                 CompoundTag payload = incoming.get(move.shareId());
@@ -901,17 +1909,15 @@ public final class InventoryIsolationService implements AutoCloseable {
                 }
                 after.put(move.shareId(), payload);
             }
-            if (WorldIdentities.from(player.serverLevel()).equals(targetWorld)) {
-                LinkedHashMap<String, CompoundTag> currentPayloads = new LinkedHashMap<>();
-                for (Map.Entry<String, SharableAdapter> entry : activeAdapters.entrySet()) {
-                    CompoundTag payload = after.get(entry.getKey());
-                    if (payload == null) {
-                        payload = entry.getValue().capture(player, player.registryAccess());
-                    }
-                    currentPayloads.put(entry.getKey(), payload);
+            LinkedHashMap<String, CompoundTag> currentPayloads = new LinkedHashMap<>();
+            for (Map.Entry<String, SharableAdapter> entry : activeAdapters.entrySet()) {
+                CompoundTag payload = after.get(entry.getKey());
+                if (payload == null) {
+                    payload = entry.getValue().capture(player, player.registryAccess());
                 }
-                collectWorldBackups(player, targetWorld, targetKeys, activeAdapters, currentPayloads, writes);
+                currentPayloads.put(entry.getKey(), payload);
             }
+            collectWorldBackups(player, finalWorld, finalKeys, activeAdapters, currentPayloads, writes);
 
             List<TransitionJournal.Change> completed = LiveStateCoordinator.withAfter(changes, after);
             TransitionJournal.complete(journal, "committed", completed, null);
@@ -920,23 +1926,20 @@ public final class InventoryIsolationService implements AutoCloseable {
                     revision,
                     writes,
                     Optional.of(journal),
-                    archives.stream()
-                            .map(archive -> new ProfileSnapshotWriter.Archive(
-                                    archive.key(), archive.category(), archive.reason()))
-                            .toList(),
+                    archives.stream().map(ArchiveRequest::toStoreArchive).toList(),
                     reason);
             sessions.put(player.getUUID(), new Session(
-                    player, player.serverLevel().dimension(), targetWorld, targetGameMode, targetKeys, activeAdapters,
-                    current.generation(), new LocationTracker(player)));
+                    player, player.serverLevel().dimension(), finalWorld, targetGameMode, finalKeys, activeAdapters,
+                    current.generation(), new LocationTracker(player), session.phase()));
         } catch (Exception failure) {
             if (hasPendingCommit(failure)) {
-                quarantinedPlayers.add(player.getUUID());
+                recordQuarantine(player.getUUID());
                 throw transitionFailure("Profile transaction is pending durable recovery", failure);
             }
             Exception rollbackFailure = null;
             if (mutationStarted) {
                 try {
-                    rollback(player, before);
+                    rollback(player, rollbackSnapshots);
                 } catch (Exception failedRollback) {
                     rollbackFailure = failedRollback;
                     failure.addSuppressed(failedRollback);
@@ -948,6 +1951,152 @@ public final class InventoryIsolationService implements AutoCloseable {
             }
             throw transitionFailure("Profile transaction rolled back", failure);
         }
+    }
+
+    private static Map<String, SharableAdapter> withoutLastLocation(
+            Map<String, SharableAdapter> activeAdapters) {
+        if (!activeAdapters.containsKey(AdapterIds.LAST_LOCATION.getPath())) {
+            return activeAdapters;
+        }
+        LinkedHashMap<String, SharableAdapter> filtered = new LinkedHashMap<>(activeAdapters);
+        filtered.remove(AdapterIds.LAST_LOCATION.getPath());
+        return Collections.unmodifiableMap(filtered);
+    }
+
+    private CompoundTag prepareStoredPayload(
+            ServerPlayer player,
+            SharableAdapter adapter,
+            ProfileKey key,
+            StoredProfile stored,
+            List<ArchiveRequest> archives) {
+        CompoundTag payload = stored.payload();
+        if (adapter instanceof AdvancementAdapter advancements) {
+            AdvancementPreparation preparation = advancements.prepare(
+                    player.server.getAdvancements(),
+                    payload,
+                    state.config().model().advancementMigration());
+            AdvancementCompatibilityReport report = preparation.report();
+            payload = preparation.payload();
+            if (report.changed()) {
+                ArchiveRequest archive = new ArchiveRequest(
+                        key, "compatibility", compatibilityReason(report), new CompoundTag());
+                if (!archives.contains(archive)) {
+                    archives.add(archive);
+                }
+                if (compatibilityDiagnostics.record(key, stored.revision(), report)) {
+                    logger.warn(
+                            "Advancement profile compatibility degraded: player={} scope={}:{} share={} "
+                                    + "profileRevision={} staleAdvancementsSkipped={} staleCriteriaSkipped={} "
+                                    + "advancementAliasesMigrated={} criterionAliasesMigrated={} "
+                                    + "advancementSamples={} criterionSamples={}",
+                            player.getUUID(),
+                            key.scope().type().name().toLowerCase(java.util.Locale.ROOT),
+                            key.scope().id(),
+                            key.shareId(),
+                            stored.revision(),
+                            report.staleAdvancementsSkipped(),
+                            report.staleCriteriaSkipped(),
+                            report.advancementAliasesMigrated(),
+                            report.criterionAliasesMigrated(),
+                            report.advancementSamples(),
+                            report.criterionSamples());
+                }
+            }
+        }
+        if (ItemProfileCompatibility.supports(key.shareId())) {
+            ItemPayloadPreparation preparation = ItemProfileCompatibility.prepare(
+                    key.shareId(), payload, player.registryAccess(),
+                    state.config().model().itemMigration());
+            ItemCompatibilityReport report = preparation.report();
+            payload = preparation.payload();
+            if (report.changed()) {
+                ArchiveRequest archive = new ArchiveRequest(
+                        key, "missing_items", itemCompatibilityReason(report),
+                        itemArchiveDetails(
+                                key, stored, report, player.server.getServerVersion(), runtimeModVersion()));
+                if (!archives.contains(archive)) {
+                    archives.add(archive);
+                }
+                if (compatibilityDiagnostics.recordItems(key, stored.revision(), report)) {
+                    logger.warn(
+                            "Item profile compatibility degraded: player={} profile={} revision={} share={} "
+                                    + "quarantined={} missingItems={} missingComponents={} aliasesApplied={} "
+                                    + "samples={} archiveRevision=pending",
+                            player.getUUID(), key, stored.revision(), key.shareId(), report.issues().size(),
+                            report.missingItems(), report.missingComponents(), report.aliasesApplied(),
+                            report.issues().stream().limit(5)
+                                    .map(issue -> issue.logicalSlot() + '=' + issue.itemId())
+                                    .toList());
+                }
+            }
+        }
+        return payload;
+    }
+
+    private static CompoundTag itemArchiveDetails(
+            ProfileKey key,
+            StoredProfile stored,
+            ItemCompatibilityReport report,
+            String serverVersion,
+            String modVersion) {
+        CompoundTag details = new CompoundTag();
+        details.putInt("schema_version", 1);
+        details.putString("adapter", key.shareId());
+        details.putString("server_version", serverVersion);
+        details.putString("mod_version", modVersion);
+        ListTag entries = new ListTag();
+        for (ItemCompatibilityIssue issue : report.issues()) {
+            CompoundTag entry = new CompoundTag();
+            entry.putString("logical_slot", issue.logicalSlot());
+            entry.putString("reason", issue.reason().name());
+            if (issue.itemId() != null) {
+                entry.putString("item_id", issue.itemId().toString());
+            }
+            ListTag components = new ListTag();
+            issue.componentIds().forEach(id -> components.add(net.minecraft.nbt.StringTag.valueOf(id.toString())));
+            entry.put("component_ids", components);
+            entry.put("original_stack", issue.originalStack());
+            entries.add(entry);
+        }
+        details.put("entries", entries);
+        details.putLong("source_revision", stored.revision());
+        details.putString("source_checksum", stored.checksum());
+        details.putLong("discovered_at", java.time.Instant.now().toEpochMilli());
+        details.putInt("aliases_applied", report.aliasesApplied());
+        return details;
+    }
+
+    private static String runtimeModVersion() {
+        return net.neoforged.fml.ModList.get().getModContainerById(dev.yu.mwi.YuMultiverseInventory.MOD_ID)
+                .map(container -> container.getModInfo().getVersion().toString())
+                .orElse("unknown");
+    }
+
+    private static String itemCompatibilityReason(ItemCompatibilityReport report) {
+        return "item registry schema drift: missing items=" + report.missingItems()
+                + ", missing components=" + report.missingComponents()
+                + ", aliases=" + report.aliasesApplied();
+    }
+
+    private static String compatibilityReason(AdvancementCompatibilityReport report) {
+        return "advancement registry schema drift: stale advancements="
+                + report.staleAdvancementsSkipped()
+                + ", stale criteria=" + report.staleCriteriaSkipped()
+                + ", advancement aliases=" + report.advancementAliasesMigrated()
+                + ", criterion aliases=" + report.criterionAliasesMigrated();
+    }
+
+    private void logSkippedSourceLocation(
+            ServerPlayer player,
+            WorldIdentity sourceWorld,
+            WorldIdentity targetWorld) {
+        logger.warn(
+                "Skipped source last_location snapshot: player={}/{} from={} to={} "
+                        + "reason=source coordinates unavailable after pre-login dimension transition",
+                player.getGameProfile().getName(),
+                player.getUUID(),
+                sourceWorld.name(),
+                targetWorld.name());
     }
 
     private CompoundTag migrateGroupTarget(
@@ -972,12 +2121,42 @@ public final class InventoryIsolationService implements AutoCloseable {
         }
         result.archives().forEach(key ->
                 archives.add(new ArchiveRequest(key, "conflicts", "group profile migration")));
-        writes.put(groupKey, result.payload());
-        return result.payload();
+        SharableAdapter adapter = adapters.require(AdapterIds.id(groupKey.shareId()));
+        CompoundTag payload = result.sourceProfile() == null
+                ? preparePayload(player, adapter, result.payload())
+                : prepareStoredPayload(
+                        player,
+                        adapter,
+                        result.sourceKey(),
+                        result.sourceProfile(),
+                        archives);
+        writes.put(groupKey, payload);
+        return payload;
+    }
+
+    private CompoundTag preparePayload(
+            ServerPlayer player, SharableAdapter adapter, CompoundTag payload) {
+        CompoundTag prepared = payload.copy();
+        if (adapter instanceof AdvancementAdapter advancements) {
+            prepared = advancements.prepare(
+                    player.server.getAdvancements(),
+                    prepared,
+                    state.config().model().advancementMigration()).payload();
+        }
+        if (ItemProfileCompatibility.supports(adapter.id().getPath())) {
+            prepared = ItemProfileCompatibility.prepare(
+                    adapter.id().getPath(), prepared, player.registryAccess(),
+                    state.config().model().itemMigration()).payload();
+        }
+        return prepared;
     }
 
     private void reseedCurrent(ServerPlayer player, String reason) throws TransitionException {
         State current = state;
+        Session existing = sessions.get(player.getUUID());
+        SessionPhase phase = existing != null && existing.owner() == player
+                ? existing.phase()
+                : SessionPhase.ACTIVE;
         WorldIdentity world = WorldIdentities.from(player.serverLevel());
         Map<String, SharableAdapter> active = activeAdapters(player, current);
         Map<String, ProfileKey> keys = profileKeys(player, world, current, active);
@@ -989,7 +2168,7 @@ public final class InventoryIsolationService implements AutoCloseable {
                     revision, reason, true);
             sessions.put(player.getUUID(), new Session(
                     player, player.serverLevel().dimension(), world, gameMode(player, current.config()), keys, active,
-                    current.generation(), new LocationTracker(player)));
+                    current.generation(), new LocationTracker(player), phase));
         } catch (IOException | RuntimeException failure) {
             throw new TransitionException("Unable to persist " + reason + " state", failure);
         }
@@ -1001,13 +2180,23 @@ public final class InventoryIsolationService implements AutoCloseable {
 
     private void persistCurrent(ServerPlayer player, String reason, boolean asynchronous) throws TransitionException {
         State current = state;
-        WorldIdentity world = WorldIdentities.from(player.serverLevel());
-        Map<String, SharableAdapter> active = activeAdapters(player, current);
-        Map<String, ProfileKey> keys = profileKeys(player, world, current, active);
+        Session session = sessions.get(player.getUUID());
+        if (session == null || session.owner() != player) {
+            throw new TransitionException(
+                    "Refusing canonical persistence without an owned inventory session for " + reason);
+        }
+        GameModeBucket liveGameMode = gameMode(player, current.config());
+        if (!session.dimension().equals(player.serverLevel().dimension())
+                || !session.world().equals(WorldIdentities.from(player.serverLevel()))
+                || session.gameMode() != liveGameMode
+                || session.configGeneration() != current.generation()) {
+            throw new TransitionException(
+                    "Refusing canonical persistence from stale/unknown live-state ownership for " + reason);
+        }
         long revision = nextRevision(player);
         try {
             snapshotWriter.persist(
-                    player, world, keys, active,
+                    player, session.world(), session.profiles(), session.activeAdapters(),
                     current.config().model().shareHandling().alwaysWriteWorldProfile(),
                     revision, reason, asynchronous);
         } catch (IOException | RuntimeException failure) {
@@ -1056,10 +2245,18 @@ public final class InventoryIsolationService implements AutoCloseable {
     }
 
     private long nextRevision(ServerPlayer player) throws TransitionException {
+        long started = System.nanoTime();
         try {
             return store.nextRevision(player.getUUID());
         } catch (IOException failure) {
             throw new TransitionException("Unable to allocate profile revision", failure);
+        } finally {
+            synchronized (revisionAllocationLatenciesNanos) {
+                revisionAllocationLatenciesNanos.add(System.nanoTime() - started);
+                if (revisionAllocationLatenciesNanos.size() > 2_048) {
+                    revisionAllocationLatenciesNanos.subList(0, 1_024).clear();
+                }
+            }
         }
     }
 
@@ -1123,7 +2320,18 @@ public final class InventoryIsolationService implements AutoCloseable {
     private record Move(String shareId, SharableAdapter adapter, ProfileKey fromKey, ProfileKey toKey) {
     }
 
-    private record ArchiveRequest(ProfileKey key, String category, String reason) {
+    private record ArchiveRequest(ProfileKey key, String category, String reason, CompoundTag details) {
+        private ArchiveRequest(ProfileKey key, String category, String reason) {
+            this(key, category, reason, new CompoundTag());
+        }
+
+        private ArchiveRequest {
+            details = details.copy();
+        }
+
+        private ProfileArchive toStoreArchive() {
+            return new ProfileArchive(key, category, reason, details);
+        }
     }
 
     private record Session(
@@ -1134,18 +2342,40 @@ public final class InventoryIsolationService implements AutoCloseable {
             Map<String, ProfileKey> profiles,
             Map<String, SharableAdapter> activeAdapters,
             long configGeneration,
-            LocationTracker location
+            LocationTracker location,
+            SessionPhase phase
     ) {
         private Session {
             Objects.requireNonNull(owner, "owner");
             Objects.requireNonNull(dimension, "dimension");
+            Objects.requireNonNull(world, "world");
+            Objects.requireNonNull(gameMode, "gameMode");
             profiles = Map.copyOf(profiles);
             activeAdapters = Map.copyOf(activeAdapters);
             Objects.requireNonNull(location, "location");
+            Objects.requireNonNull(phase, "phase");
+        }
+
+        private Session activate() {
+            return phase == SessionPhase.ACTIVE
+                    ? this
+                    : new Session(
+                            owner, dimension, world, gameMode, profiles, activeAdapters,
+                            configGeneration, location, SessionPhase.ACTIVE);
+        }
+    }
+
+    private enum SessionPhase {
+        PROVISIONAL,
+        ACTIVE;
+
+        private String logName() {
+            return name().toLowerCase(java.util.Locale.ROOT);
         }
     }
 
     private static final class LocationTracker {
+        private boolean known;
         private String dimension;
         private double x;
         private double y;
@@ -1157,7 +2387,15 @@ public final class InventoryIsolationService implements AutoCloseable {
             update(player);
         }
 
+        private LocationTracker() {
+        }
+
+        private static LocationTracker unknown() {
+            return new LocationTracker();
+        }
+
         private void update(ServerPlayer player) {
+            known = true;
             dimension = player.serverLevel().dimension().location().toString();
             x = player.getX();
             y = player.getY();
@@ -1166,7 +2404,10 @@ public final class InventoryIsolationService implements AutoCloseable {
             pitch = player.getXRot();
         }
 
-        private CompoundTag toPayload() {
+        private Optional<CompoundTag> payload() {
+            if (!known) {
+                return Optional.empty();
+            }
             CompoundTag payload = new CompoundTag();
             payload.putString("dimension", dimension);
             payload.putDouble("x", x);
@@ -1174,7 +2415,7 @@ public final class InventoryIsolationService implements AutoCloseable {
             payload.putDouble("z", z);
             payload.putFloat("yaw", yaw);
             payload.putFloat("pitch", pitch);
-            return payload;
+            return Optional.of(payload);
         }
     }
 
@@ -1224,6 +2465,15 @@ public final class InventoryIsolationService implements AutoCloseable {
             long p99WriteLatencyMillis,
             long failures,
             long coalesced,
+            long queued,
+            long rejected,
+            int activeWorkers,
+            long p95CommitLatencyMillis,
+            long p99CommitLatencyMillis,
+            int quarantinedPlayers,
+            long quarantineEvents,
+            long p95RevisionAllocationLatencyMillis,
+            long p99RevisionAllocationLatencyMillis,
             long p95CaptureLatencyMillis,
             long p99CaptureLatencyMillis) {
     }
@@ -1236,6 +2486,181 @@ public final class InventoryIsolationService implements AutoCloseable {
             long maxCaptureBatchMillis,
             long totalSynchronizationMillis,
             long maxSynchronizationMillis) {
+    }
+
+    public record CompatibilityMetrics(
+            long staleAdvancementsSkipped,
+            long staleCriteriaSkipped,
+            long profilesCompatibilityDegraded,
+            long advancementAliasesMigrated,
+            long criterionAliasesMigrated,
+            long missingItemStacksQuarantined,
+            long missingComponentStacksQuarantined,
+            long itemAliasesApplied,
+            long missingItemRepairFailures) {
+    }
+
+    public record AdvancementRepairReport(
+            int scannedProfiles,
+            int modifiedProfiles,
+            int advancementAliasesMigrated,
+            int criterionAliasesMigrated,
+            int staleAdvancementsSkipped,
+            int staleCriteriaSkipped,
+            long archiveRevision,
+            boolean applied,
+            List<String> errors) {
+        public AdvancementRepairReport {
+            errors = List.copyOf(errors);
+        }
+    }
+
+    public record BedSpawnRepairReport(
+            int scannedProfiles,
+            int matchedProfiles,
+            int clearedProfiles,
+            long revision,
+            boolean applied,
+            List<BedSpawnProfileInspection> profiles) {
+        public BedSpawnRepairReport {
+            profiles = List.copyOf(profiles);
+        }
+    }
+
+    public record BedSpawnProfileInspection(
+            ProfileKey key,
+            long profileRevision,
+            boolean present,
+            Optional<String> dimension,
+            Optional<Boolean> loaded,
+            Optional<String> validationError) {
+        public BedSpawnProfileInspection {
+            Objects.requireNonNull(key, "key");
+            dimension = Objects.requireNonNull(dimension, "dimension");
+            loaded = Objects.requireNonNull(loaded, "loaded");
+            validationError = Objects.requireNonNull(validationError, "validationError");
+        }
+
+        public String scopeSelector() {
+            return bedSpawnScopeSelector(key);
+        }
+
+        public boolean requiresClear() {
+            return present || validationError.isPresent();
+        }
+    }
+
+    public record MissingItemRepairReport(
+            int scannedProfiles,
+            int modifiedProfiles,
+            int quarantinedStacks,
+            int missingItemStacks,
+            int missingComponentStacks,
+            int aliasesApplied,
+            long archiveRevision,
+            boolean applied,
+            Map<String, Integer> byNamespace,
+            Map<String, Integer> byShare,
+            List<String> errors) {
+        public MissingItemRepairReport {
+            byNamespace = Map.copyOf(byNamespace);
+            byShare = Map.copyOf(byShare);
+            errors = List.copyOf(errors);
+        }
+    }
+
+    public record MissingItemArchiveSummary(
+            String entryId,
+            ProfileKey sourceKey,
+            long archiveRevision,
+            String logicalSlot,
+            String reason,
+            String itemId) {
+    }
+
+    public record MissingItemBatchRepairReport(
+            int availablePlayers,
+            int processedPlayers,
+            int scannedProfiles,
+            int modifiedProfiles,
+            int quarantinedStacks,
+            int appliedPlayers,
+            boolean truncated,
+            List<String> errors) {
+        public MissingItemBatchRepairReport {
+            errors = List.copyOf(errors);
+        }
+    }
+
+    public record MissingItemRestoreReport(
+            String entryId, ProfileKey targetKey, String logicalSlot, long revision) {
+    }
+
+    private static final class CompatibilityDiagnostics {
+        private static final int MAX_DEDUPLICATION_KEYS = 8_192;
+        private final LinkedHashMap<CompatibilityWarningKey, Boolean> warnings =
+                new LinkedHashMap<>(256, 0.75F, true);
+        private final LongAdder staleAdvancementsSkipped = new LongAdder();
+        private final LongAdder staleCriteriaSkipped = new LongAdder();
+        private final LongAdder profilesCompatibilityDegraded = new LongAdder();
+        private final LongAdder advancementAliasesMigrated = new LongAdder();
+        private final LongAdder criterionAliasesMigrated = new LongAdder();
+        private final LongAdder missingItemStacksQuarantined = new LongAdder();
+        private final LongAdder missingComponentStacksQuarantined = new LongAdder();
+        private final LongAdder itemAliasesApplied = new LongAdder();
+        private final LongAdder missingItemRepairFailures = new LongAdder();
+
+        private synchronized boolean record(
+                ProfileKey key, long revision, AdvancementCompatibilityReport report) {
+            CompatibilityWarningKey warningKey = new CompatibilityWarningKey(key, revision, "advancements");
+            if (warnings.put(warningKey, Boolean.TRUE) != null) {
+                return false;
+            }
+            if (warnings.size() > MAX_DEDUPLICATION_KEYS) {
+                warnings.remove(warnings.keySet().iterator().next());
+            }
+            staleAdvancementsSkipped.add(report.staleAdvancementsSkipped());
+            staleCriteriaSkipped.add(report.staleCriteriaSkipped());
+            profilesCompatibilityDegraded.increment();
+            advancementAliasesMigrated.add(report.advancementAliasesMigrated());
+            criterionAliasesMigrated.add(report.criterionAliasesMigrated());
+            return true;
+        }
+
+        private CompatibilityMetrics snapshot() {
+            return new CompatibilityMetrics(
+                    staleAdvancementsSkipped.sum(),
+                    staleCriteriaSkipped.sum(),
+                    profilesCompatibilityDegraded.sum(),
+                    advancementAliasesMigrated.sum(),
+                    criterionAliasesMigrated.sum(),
+                    missingItemStacksQuarantined.sum(),
+                    missingComponentStacksQuarantined.sum(),
+                    itemAliasesApplied.sum(),
+                    missingItemRepairFailures.sum());
+        }
+
+        private synchronized boolean recordItems(
+                ProfileKey key, long revision, ItemCompatibilityReport report) {
+            String reasons = report.issues().stream().map(issue -> issue.reason().name())
+                    .distinct().sorted().collect(java.util.stream.Collectors.joining(","));
+            CompatibilityWarningKey warningKey = new CompatibilityWarningKey(
+                    key, revision, "items:" + reasons + ":aliases=" + (report.aliasesApplied() > 0));
+            if (warnings.put(warningKey, Boolean.TRUE) != null) {
+                return false;
+            }
+            if (warnings.size() > MAX_DEDUPLICATION_KEYS) {
+                warnings.remove(warnings.keySet().iterator().next());
+            }
+            missingItemStacksQuarantined.add(report.missingItems());
+            missingComponentStacksQuarantined.add(report.missingComponents());
+            itemAliasesApplied.add(report.aliasesApplied());
+            profilesCompatibilityDegraded.increment();
+            return true;
+        }
+    }
+
+    private record CompatibilityWarningKey(ProfileKey key, long revision, String reasonSet) {
     }
 
     public record EditableProfile(

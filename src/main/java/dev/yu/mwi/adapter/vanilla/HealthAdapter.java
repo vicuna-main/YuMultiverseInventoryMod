@@ -26,6 +26,7 @@ public final class HealthAdapter extends AbstractVanillaAdapter {
         CompoundTag data = new CompoundTag();
         data.putFloat(HEALTH, deferred == null ? player.getHealth() : deferred.health());
         data.putFloat(ABSORPTION, deferred == null ? player.getAbsorptionAmount() : deferred.absorption());
+        validatePayload(data, id().toString());
         return data;
     }
 
@@ -38,15 +39,9 @@ public final class HealthAdapter extends AbstractVanillaAdapter {
 
     @Override
     public void apply(ServerPlayer player, CompoundTag data, HolderLookup.Provider lookup) {
-        NbtPayload.requireData(data, id().toString());
-        float health = NbtPayload.requireFloat(data, HEALTH, id().toString());
-        float absorption = NbtPayload.requireFloat(data, ABSORPTION, id().toString());
-        if (!Float.isFinite(health) || health <= 0.0F || health > 1_000_000.0F) {
-            throw NbtPayload.invalid(id().toString(), "health must be finite and in (0, 1000000]");
-        }
-        if (!Float.isFinite(absorption) || absorption < 0.0F || absorption > 1_000_000.0F) {
-            throw NbtPayload.invalid(id().toString(), "absorption must be finite and in [0, 1000000]");
-        }
+        ValidatedHealth values = validatePayload(data, id().toString());
+        float health = values.health();
+        float absorption = values.absorption();
         player.setAbsorptionAmount(absorption);
         if (health <= player.getMaxHealth()) {
             pending.remove(player.getUUID());
@@ -55,6 +50,24 @@ public final class HealthAdapter extends AbstractVanillaAdapter {
             player.setHealth(player.getMaxHealth());
             pending.put(player.getUUID(), new PendingHealth(health, absorption, 0));
         }
+    }
+
+    static ValidatedHealth validatePayload(CompoundTag data, String adapterId) {
+        NbtPayload.requireData(data, adapterId);
+        float health = NbtPayload.requireFloat(data, HEALTH, adapterId);
+        float absorption = NbtPayload.requireFloat(data, ABSORPTION, adapterId);
+        // Zero health is a legitimate live state during the death/respawn lifecycle. Rejecting it
+        // after capture made MWI capable of persisting a profile that it could not restore.
+        if (health < 0.0F || health > 1_000_000.0F) {
+            throw NbtPayload.invalid(adapterId, "health must be finite and in [0, 1000000]");
+        }
+        if (absorption < 0.0F || absorption > 1_000_000.0F) {
+            throw NbtPayload.invalid(adapterId, "absorption must be finite and in [0, 1000000]");
+        }
+        return new ValidatedHealth(health, absorption);
+    }
+
+    record ValidatedHealth(float health, float absorption) {
     }
 
     @Override

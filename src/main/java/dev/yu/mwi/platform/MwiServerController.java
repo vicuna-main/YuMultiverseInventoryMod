@@ -15,8 +15,10 @@ import dev.yu.mwi.integration.trashslot.TrashSlotInventoryAdapter;
 import dev.yu.mwi.service.InventoryIsolationService;
 import dev.yu.mwi.service.ReloadReport;
 import dev.yu.mwi.service.TransitionException;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.Level;
 import net.neoforged.fml.ModList;
 import net.neoforged.fml.loading.FMLPaths;
 import org.slf4j.Logger;
@@ -84,6 +86,7 @@ public final class MwiServerController {
         configManager = candidateManager;
         adapters = candidateAdapters;
         service = candidateService;
+        dev.yu.mwi.api.RecoveryBridgeV1.register(startingServer, service.recoveryCenter());
         pendingLogouts.clear();
         logger.info("Yu Multiverse Inventory started with {} adapters and {} world groups",
                 candidateAdapters.size(), config.model().groups().size());
@@ -99,6 +102,7 @@ public final class MwiServerController {
         try {
             service.close();
         } finally {
+            dev.yu.mwi.api.RecoveryBridgeV1.unregister(stoppingServer);
             pendingLogouts.clear();
             service = null;
             adapters = null;
@@ -113,8 +117,11 @@ public final class MwiServerController {
         requireService(player.server).login(player);
     }
 
-    public void dimensionChanged(ServerPlayer player) throws TransitionException {
-        requireService(player.server).dimensionChanged(player);
+    public void dimensionChanged(
+            ServerPlayer player,
+            ResourceKey<Level> fromDimension,
+            ResourceKey<Level> toDimension) throws TransitionException {
+        requireService(player.server).dimensionChanged(player, fromDimension, toDimension);
     }
 
     public void tick(ServerPlayer player) throws TransitionException {
@@ -126,6 +133,10 @@ public final class MwiServerController {
 
     public void respawned(ServerPlayer player) throws TransitionException {
         requireService(player.server).respawned(player);
+    }
+
+    public void invalidateRecoveryConfirmation(ServerPlayer player) {
+        if (service != null && server == player.server) service.invalidateRecoveryConfirmation(player);
     }
 
     /** Defers logout persistence until SaveToFile, after hybrid-server quit handlers have run. */
@@ -203,7 +214,8 @@ public final class MwiServerController {
                 current.model().shareHandling(),
                 current.model().shareAliases(),
                 groups,
-                current.model().migration());
+                current.model().migration(),
+                current.model().advancementMigration());
         RuntimeConfig replacement = new RuntimeConfig(
                 current.schemaVersion(), replacementModel, current.storage(), current.mvinvMode(),
                 current.mvinvDataDirectory());

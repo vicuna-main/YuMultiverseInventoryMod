@@ -3,11 +3,8 @@ package dev.yu.mwi.adapter.vanilla;
 import dev.yu.mwi.api.AdapterIds;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.HolderLookup;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceKey;
-import net.minecraft.resources.ResourceLocation;
-import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.Level;
 
@@ -39,44 +36,12 @@ public final class RespawnLocationAdapter extends AbstractVanillaAdapter {
 
     @Override
     public void clear(ServerPlayer player) {
-        player.respawnDimension = Level.OVERWORLD;
-        player.respawnPosition = null;
-        player.respawnAngle = 0.0F;
-        player.respawnForced = false;
-        if (player.getRespawnPosition() != null) {
-            throw new IllegalStateException("respawn location removal was rejected for player " + player.getUUID());
-        }
+        replace(new PlayerRespawnState(player), null);
     }
 
     @Override
     public void apply(ServerPlayer player, CompoundTag data, HolderLookup.Provider lookup) {
-        NbtPayload.requireData(data, id().toString());
-        if (!NbtPayload.requireBoolean(data, PRESENT, id().toString())) {
-            clear(player);
-            return;
-        }
-
-        ResourceLocation dimensionId = parseResourceLocation(
-                NbtPayload.requireString(data, DIMENSION, id().toString()), DIMENSION);
-        ResourceKey<Level> dimension = ResourceKey.create(Registries.DIMENSION, dimensionId);
-        ServerLevel level = player.server.getLevel(dimension);
-        if (level == null) {
-            throw NbtPayload.invalid(id().toString(), "unknown or unloaded dimension " + dimensionId);
-        }
-        BlockPos position = BlockPos.of(NbtPayload.requireLong(data, POSITION, id().toString()));
-        float angle = NbtPayload.requireFloat(data, ANGLE, id().toString());
-        boolean forced = NbtPayload.requireBoolean(data, FORCED, id().toString());
-
-        player.respawnDimension = dimension;
-        player.respawnPosition = position;
-        player.respawnAngle = angle;
-        player.respawnForced = forced;
-        if (!position.equals(player.getRespawnPosition())
-                || !dimension.equals(player.getRespawnDimension())
-                || Float.compare(angle, player.getRespawnAngle()) != 0
-                || forced != player.isRespawnForced()) {
-            throw new IllegalStateException("respawn location application was rejected for player " + player.getUUID());
-        }
+        applyTo(new PlayerRespawnState(player), data);
     }
 
     @Override
@@ -89,11 +54,76 @@ public final class RespawnLocationAdapter extends AbstractVanillaAdapter {
         return false;
     }
 
-    private ResourceLocation parseResourceLocation(String value, String field) {
-        try {
-            return ResourceLocation.parse(value);
-        } catch (RuntimeException exception) {
-            throw NbtPayload.invalid(id().toString(), "invalid " + field + " id '" + value + "'");
+    static void applyTo(RespawnState state, CompoundTag data) {
+        RespawnLocationPayload payload = RespawnLocationPayload.decode(data);
+        replace(state, payload.target().orElse(null));
+    }
+
+    private static void replace(RespawnState state, RespawnLocationPayload.Target target) {
+        ResourceKey<Level> dimension = target == null ? Level.OVERWORLD : target.dimension();
+        BlockPos position = target == null ? null : target.position();
+        float angle = target == null ? 0.0F : target.angle();
+        boolean forced = target != null && target.forced();
+
+        state.replace(dimension, position, angle, forced);
+        if (!java.util.Objects.equals(position, state.position())
+                || !dimension.equals(state.dimension())
+                || Float.compare(angle, state.angle()) != 0
+                || forced != state.forced()) {
+            throw new IllegalStateException("respawn location application was rejected for player " + state.playerId());
+        }
+    }
+
+    interface RespawnState {
+        java.util.UUID playerId();
+
+        ResourceKey<Level> dimension();
+
+        BlockPos position();
+
+        float angle();
+
+        boolean forced();
+
+        void replace(ResourceKey<Level> dimension, BlockPos position, float angle, boolean forced);
+    }
+
+    private record PlayerRespawnState(ServerPlayer player) implements RespawnState {
+        private PlayerRespawnState {
+            java.util.Objects.requireNonNull(player, "player");
+        }
+
+        @Override
+        public java.util.UUID playerId() {
+            return player.getUUID();
+        }
+
+        @Override
+        public ResourceKey<Level> dimension() {
+            return player.getRespawnDimension();
+        }
+
+        @Override
+        public BlockPos position() {
+            return player.getRespawnPosition();
+        }
+
+        @Override
+        public float angle() {
+            return player.getRespawnAngle();
+        }
+
+        @Override
+        public boolean forced() {
+            return player.isRespawnForced();
+        }
+
+        @Override
+        public void replace(ResourceKey<Level> dimension, BlockPos position, float angle, boolean forced) {
+            player.respawnDimension = dimension;
+            player.respawnPosition = position;
+            player.respawnAngle = angle;
+            player.respawnForced = forced;
         }
     }
 }

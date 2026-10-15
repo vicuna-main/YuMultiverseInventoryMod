@@ -18,7 +18,7 @@ Cosmetic Armor Reworked, and TrashSlot isolation through soft-loaded adapters.
 [[dependencies.${mod_id}]]
 modId="neoforge"
 type="required"
-versionRange="[21.1.235,)"
+versionRange="[21.1.244,)"
 ordering="NONE"
 side="BOTH"
 

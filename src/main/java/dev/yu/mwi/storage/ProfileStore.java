@@ -12,11 +12,34 @@ import java.util.UUID;
 
 /** Durable, per-share profile storage. Implementations must return defensive NBT copies. */
 public interface ProfileStore extends AutoCloseable {
+    /** Must atomically commit profiles, remaining escrow and the permanent source/operation receipt. */
+    default void commitRecovery(UUID playerId, long revision, Map<ProfileKey, CompoundTag> profiles,
+                                RecoveryMutation mutation) throws IOException {
+        throw new IOException("This profile store does not support atomic recovery");
+    }
+
+    default Optional<StoredRecovery> loadRecovery(UUID playerId, UUID sourceId) throws IOException {
+        return Optional.empty();
+    }
+
+    default List<StoredRecovery> listRecoveries(UUID playerId) throws IOException { return List.of(); }
+
+    default Optional<CompoundTag> recoveryOperation(UUID playerId, UUID operationId) throws IOException {
+        return Optional.empty();
+    }
+
     Optional<StoredProfile> load(ProfileKey key) throws IOException;
 
     /** Loads a complete player working set for server-thread, disk-free profile transitions. */
     default Map<ProfileKey, StoredProfile> loadPlayerProfiles(UUID playerId) throws IOException {
         return Map.of();
+    }
+
+    /** Reads and validates a player working set without changing caches, files, or revision state. */
+    Map<ProfileKey, StoredProfile> inspectPlayerProfiles(UUID playerId) throws IOException;
+
+    default PlayerProfileIds listPlayerProfileIds() throws IOException {
+        return new PlayerProfileIds(List.of());
     }
 
     SaveResult save(ProfileKey key, CompoundTag payload, long revision) throws IOException;
@@ -38,7 +61,23 @@ public interface ProfileStore extends AutoCloseable {
         }
     }
 
+    default void commitBatch(
+            UUID playerId,
+            long revision,
+            Map<ProfileKey, CompoundTag> profiles,
+            Optional<CompoundTag> completedJournal,
+            List<ProfileArchive> archives) throws IOException {
+        for (ProfileArchive archive : archives) {
+            archive(archive.key(), archive.category(), archive.reason(), revision, archive.details());
+        }
+        commitBatch(playerId, revision, profiles, completedJournal);
+    }
+
     void delete(ProfileKey key) throws IOException;
+
+    void invalidate(ProfileKey key);
+
+    void invalidatePlayer(UUID playerId);
 
     long nextRevision(UUID playerId) throws IOException;
 
@@ -54,6 +93,15 @@ public interface ProfileStore extends AutoCloseable {
     }
 
     void archive(ProfileKey key, String category, String reason, long revision) throws IOException;
+
+    default void archive(
+            ProfileKey key, String category, String reason, long revision, CompoundTag details) throws IOException {
+        archive(key, category, reason, revision);
+    }
+
+    default List<CompatibilityArchiveEntry> listCompatibilityArchives(UUID playerId) throws IOException {
+        return List.of();
+    }
 
     void writeLostFound(UUID playerId, String shareId, CompoundTag payload, String reason, long revision)
             throws IOException;

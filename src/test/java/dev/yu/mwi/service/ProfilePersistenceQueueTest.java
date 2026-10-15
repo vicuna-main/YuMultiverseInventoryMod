@@ -43,6 +43,11 @@ class ProfilePersistenceQueueTest {
 
         IOException failure = assertThrows(IOException.class, () -> queue.flush(playerId));
         assertEquals("disk unavailable", failure.getMessage());
+        assertThrows(IOException.class, () -> queue.flush(playerId),
+                "Acknowledging an I/O error must not reopen the synchronous recovery write barrier");
+        UUID healthy = UUID.randomUUID();
+        queue.submit(healthy, () -> {});
+        queue.flush(healthy);
         queue.close();
     }
 
@@ -84,12 +89,20 @@ class ProfilePersistenceQueueTest {
 
     @Test
     void fullQueueRejectsWithoutRunningIoOnCaller() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         ProfilePersistenceQueue queue = new ProfilePersistenceQueue(1, 1, Duration.ofSeconds(2));
-        queue.submit(UUID.randomUUID(), () -> await(release));
+        queue.submit(UUID.randomUUID(), () -> {
+            started.countDown();
+            await(release);
+        });
+        assertTrue(started.await(1, TimeUnit.SECONDS));
         assertThrows(RejectedExecutionException.class,
                 () -> queue.submit(UUID.randomUUID(), () -> { }));
         assertEquals(1, queue.metrics().queueDepth());
+        assertEquals(1, queue.metrics().queued());
+        assertEquals(1, queue.metrics().rejected());
+        assertEquals(1, queue.metrics().activeWorkers());
         release.countDown();
         queue.close();
     }
@@ -107,7 +120,24 @@ class ProfilePersistenceQueueTest {
             queue.flush(playerId);
             assertEquals(2, persisted.get());
             assertEquals(1, queue.metrics().coalesced());
+            assertEquals(3, queue.metrics().queued());
         }
+    }
+
+    @Test
+    void closeReportsAWorkerThatDoesNotFinishWithinTheFlushDeadline() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ProfilePersistenceQueue queue = new ProfilePersistenceQueue(1, 1, Duration.ofMillis(100));
+        queue.submit(UUID.randomUUID(), () -> {
+            started.countDown();
+            await(release);
+        });
+        assertTrue(started.await(1, TimeUnit.SECONDS));
+
+        IOException failure = assertThrows(IOException.class, queue::close);
+        assertTrue(failure.getMessage().contains("Timed out flushing profile persistence"));
+        release.countDown();
     }
 
     private static void await(CountDownLatch latch) throws IOException {

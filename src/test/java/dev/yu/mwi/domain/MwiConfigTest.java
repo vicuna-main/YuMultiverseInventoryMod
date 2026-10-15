@@ -27,6 +27,9 @@ class MwiConfigTest {
         assertEquals(MwiConfig.ProfileConflictPolicy.PREFER_CURRENT_WORLD,
                 config.migration().onProfileConflict());
         assertTrue(config.migration().archiveConflicts());
+        assertEquals(MwiConfig.MissingItemPolicy.QUARANTINE_AND_CONTINUE,
+                config.itemMigration().missingItemPolicy());
+        assertTrue(config.itemMigration().aliases().isEmpty());
         assertEquals(List.of("default", "resource", "lobby"),
                 config.groups().stream().map(WorldGroup::name).toList());
     }
@@ -75,5 +78,42 @@ class MwiConfigTest {
 
         assertEquals(ScopeKey.group("default"),
                 config.createGroupResolver(catalog).resolve(new WorldIdentity("custom"), "health"));
+    }
+
+    @Test
+    void advancementMigrationRejectsCyclesAndResolvesChains() {
+        net.minecraft.resources.ResourceLocation first =
+                net.minecraft.resources.ResourceLocation.parse("example:first");
+        net.minecraft.resources.ResourceLocation second =
+                net.minecraft.resources.ResourceLocation.parse("example:second");
+        net.minecraft.resources.ResourceLocation current =
+                net.minecraft.resources.ResourceLocation.parse("example:current");
+
+        assertThrows(IllegalArgumentException.class, () -> new MwiConfig.AdvancementMigration(
+                Map.of(first, second, second, first), Map.of()));
+        MwiConfig.AdvancementMigration migration = new MwiConfig.AdvancementMigration(
+                Map.of(first, second, second, current),
+                Map.of(current, Map.of("old", "middle", "middle", "new")));
+
+        assertEquals(current, migration.resolveAdvancement(first));
+        assertEquals("new", migration.resolveCriterion(current, "old"));
+    }
+
+    @Test
+    void itemMigrationRejectsCyclesAndResolvesChains() {
+        net.minecraft.resources.ResourceLocation first =
+                net.minecraft.resources.ResourceLocation.parse("example:first");
+        net.minecraft.resources.ResourceLocation second =
+                net.minecraft.resources.ResourceLocation.parse("example:second");
+        net.minecraft.resources.ResourceLocation current =
+                net.minecraft.resources.ResourceLocation.parse("minecraft:stone");
+
+        assertThrows(IllegalArgumentException.class, () -> new MwiConfig.ItemMigration(
+                MwiConfig.MissingItemPolicy.QUARANTINE_AND_CONTINUE,
+                Map.of(first, second, second, first)));
+        MwiConfig.ItemMigration migration = new MwiConfig.ItemMigration(
+                MwiConfig.MissingItemPolicy.QUARANTINE_AND_CONTINUE,
+                Map.of(first, second, second, current));
+        assertEquals(current, migration.resolve(first));
     }
 }

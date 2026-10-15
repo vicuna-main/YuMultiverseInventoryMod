@@ -14,6 +14,14 @@ import java.util.UUID;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.HashSet;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -23,6 +31,163 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class NbtProfileStoreTest {
     @TempDir
     Path temporaryDirectory;
+
+    @Test
+    void nextRevisionIsMemoryOnlyAndConcurrentAllocationsAreUnique() throws Exception {
+        UUID playerId = UUID.randomUUID();
+        NbtProfileStore store = new NbtProfileStore(temporaryDirectory, 5, 32);
+        Path counter = temporaryDirectory.resolve("data/mwi/revision_counters").resolve(playerId + ".dat");
+
+        try (ExecutorService workers = Executors.newFixedThreadPool(8)) {
+            CountDownLatch start = new CountDownLatch(1);
+            List<Future<Long>> allocations = java.util.stream.IntStream.range(0, 64)
+                    .mapToObj(ignored -> workers.submit(() -> {
+                        assertTrue(start.await(2, TimeUnit.SECONDS));
+                        return store.nextRevision(playerId);
+                    }))
+                    .toList();
+            start.countDown();
+            List<Long> revisions = allocations.stream().map(NbtProfileStoreTest::get).sorted().toList();
+            assertEquals(64, new HashSet<>(revisions).size());
+            assertEquals(java.util.stream.LongStream.rangeClosed(1, 64).boxed().toList(), revisions);
+        }
+        assertFalse(Files.exists(counter), "revision allocation must not perform caller-thread disk I/O");
+    }
+
+    @Test
+    void blockedProfileReadForOnePlayerDoesNotBlockRevisionAllocationOrAnotherPlayer() throws Exception {
+        UUID blockedPlayer = UUID.randomUUID();
+        UUID progressingPlayer = UUID.randomUUID();
+        ProfileKey blockedKey = key(blockedPlayer, "minecraft:overworld", "inventory_contents");
+        ProfileKey progressingKey = key(progressingPlayer, "minecraft:overworld", "inventory_contents");
+        CompoundTag initial = new CompoundTag();
+        initial.putString("marker", "initial");
+        NbtProfileStore seed = new NbtProfileStore(temporaryDirectory, 5, 32);
+        seed.save(blockedKey, initial, seed.nextRevision(blockedPlayer));
+        seed.save(progressingKey, initial, seed.nextRevision(progressingPlayer));
+        seed.close();
+
+        CountDownLatch blockedReadStarted = new CountDownLatch(1);
+        CountDownLatch releaseBlockedRead = new CountDownLatch(1);
+        NbtProfileStore.FaultInjector blocker = new NbtProfileStore.FaultInjector() {
+            @Override
+            public void beforeProfileRead(Path file, ProfileKey key) throws java.io.IOException {
+                if (key.playerId().equals(blockedPlayer)) {
+                    blockedReadStarted.countDown();
+                    await(releaseBlockedRead);
+                }
+            }
+        };
+        NbtProfileStore store = new NbtProfileStore(temporaryDirectory, 5, 32, 16, blocker);
+        store.invalidatePlayer(blockedPlayer);
+        store.invalidatePlayer(progressingPlayer);
+        CompoundTag updated = new CompoundTag();
+        updated.putString("marker", "updated");
+
+        try (ExecutorService workers = Executors.newFixedThreadPool(4)) {
+            Future<?> blocked = workers.submit(() -> {
+                store.commitBatch(blockedPlayer, store.nextRevision(blockedPlayer),
+                        Map.of(blockedKey, updated), Optional.empty());
+                return null;
+            });
+            assertTrue(blockedReadStarted.await(2, TimeUnit.SECONDS));
+
+            assertEquals(2L, workers.submit(() -> store.nextRevision(progressingPlayer))
+                    .get(1, TimeUnit.SECONDS));
+            assertEquals(3L, workers.submit(() -> store.nextRevision(blockedPlayer))
+                    .get(1, TimeUnit.SECONDS));
+            workers.submit(store::cacheStats).get(1, TimeUnit.SECONDS);
+            Future<?> progressing = workers.submit(() -> {
+                store.commitBatch(progressingPlayer, 2L,
+                        Map.of(progressingKey, updated), Optional.empty());
+                return null;
+            });
+            progressing.get(1, TimeUnit.SECONDS);
+            assertFalse(releaseBlockedRead.await(5, TimeUnit.SECONDS),
+                    "the simulated disk read must remain blocked for the full acceptance interval");
+            releaseBlockedRead.countDown();
+            blocked.get(2, TimeUnit.SECONDS);
+        } finally {
+            releaseBlockedRead.countDown();
+        }
+    }
+
+    @Test
+    void concurrentCacheMutationPreservesWeightAndEntryInvariants() throws Exception {
+        NbtProfileStore store = new NbtProfileStore(temporaryDirectory, 5, 8, 1);
+        List<UUID> players = java.util.stream.IntStream.range(0, 12)
+                .mapToObj(ignored -> UUID.randomUUID()).toList();
+        try (ExecutorService workers = Executors.newFixedThreadPool(8)) {
+            CountDownLatch start = new CountDownLatch(1);
+            List<? extends Future<?>> tasks = players.stream().map(playerId -> workers.submit(() -> {
+                assertTrue(start.await(2, TimeUnit.SECONDS));
+                ProfileKey key = key(playerId, "minecraft:overworld", "inventory_contents");
+                for (int index = 0; index < 20; index++) {
+                    CompoundTag payload = new CompoundTag();
+                    payload.putInt("index", index);
+                    store.save(key, payload, store.nextRevision(playerId));
+                    store.load(key);
+                    if ((index & 3) == 0) {
+                        store.invalidate(key);
+                    }
+                }
+                return null;
+            })).toList();
+            start.countDown();
+            for (Future<?> task : tasks) {
+                task.get(10, TimeUnit.SECONDS);
+            }
+        }
+
+        NbtProfileStore.CacheInvariant invariant = store.cacheInvariant();
+        assertTrue(invariant.valid(), invariant::description);
+        assertTrue(invariant.entries() <= 8);
+        assertTrue(invariant.bytes() >= 0L && invariant.bytes() <= invariant.maxBytes());
+    }
+
+    @Test
+    void differentPlayersReachProfileApplyTogetherAndEvictSafely() throws Exception {
+        UUID firstPlayer = UUID.randomUUID();
+        UUID secondPlayer = UUID.randomUUID();
+        ProfileKey firstKey = key(firstPlayer, "minecraft:overworld", "inventory_contents");
+        ProfileKey secondKey = key(secondPlayer, "minecraft:overworld", "inventory_contents");
+        CyclicBarrier bothApplying = new CyclicBarrier(2);
+        NbtProfileStore.FaultInjector barrier = new NbtProfileStore.FaultInjector() {
+            @Override
+            public void beforeProfileApply(ProfileKey key, int index) throws java.io.IOException {
+                try {
+                    bothApplying.await(2, TimeUnit.SECONDS);
+                } catch (Exception failure) {
+                    throw new java.io.IOException("profile apply barrier failed", failure);
+                }
+            }
+        };
+        NbtProfileStore store = new NbtProfileStore(temporaryDirectory, 5, 1, 1, barrier);
+        CompoundTag firstPayload = new CompoundTag();
+        firstPayload.putString("marker", "first");
+        CompoundTag secondPayload = new CompoundTag();
+        secondPayload.putString("marker", "second");
+
+        try (ExecutorService workers = Executors.newFixedThreadPool(2)) {
+            Future<?> first = workers.submit(() -> {
+                store.commitBatch(firstPlayer, store.nextRevision(firstPlayer),
+                        Map.of(firstKey, firstPayload), Optional.empty());
+                return null;
+            });
+            Future<?> second = workers.submit(() -> {
+                store.commitBatch(secondPlayer, store.nextRevision(secondPlayer),
+                        Map.of(secondKey, secondPayload), Optional.empty());
+                return null;
+            });
+            first.get(5, TimeUnit.SECONDS);
+            second.get(5, TimeUnit.SECONDS);
+        }
+
+        assertEquals("first", store.load(firstKey).orElseThrow().payload().getString("marker"));
+        assertEquals("second", store.load(secondKey).orElseThrow().payload().getString("marker"));
+        assertTrue(store.cacheStats().evictions() > 0L);
+        assertTrue(store.cacheInvariant().valid(), store.cacheInvariant()::description);
+    }
 
     @Test
     void profileRoundTripsAndUnchangedPayloadIsNotRewritten() throws Exception {
@@ -130,6 +295,10 @@ class NbtProfileStoreTest {
         Path profileFile = onlyProfileFile();
         CompoundTag legacy = AtomicNbtFile.read(profileFile);
         CompoundTag legacyPayload = legacy.getCompound("payload");
+        // Historical profiles predate envelope checksums; retaining a modern envelope
+        // after changing its checksum metadata would instead construct a corrupt profile.
+        legacy.remove("envelope_checksum_algorithm");
+        legacy.remove("envelope_checksum");
         legacy.remove("checksum_algorithm");
         legacy.putString("checksum", NbtChecksums.legacySha256(legacyPayload));
         AtomicNbtFile.write(profileFile, legacy);
@@ -250,6 +419,7 @@ class NbtProfileStoreTest {
         assertEquals("inventory-new", recovered.load(inventory).orElseThrow().payload().getString("marker"));
         assertEquals("armor-new", recovered.load(armor).orElseThrow().payload().getString("marker"));
         assertEquals("committed", recovered.loadRevision(playerId, revision).orElseThrow().getString("status"));
+        assertEquals(revision + 1L, recovered.nextRevision(playerId));
         Path transactions = temporaryDirectory.resolve("data/mwi/transactions");
         try (var files = Files.walk(transactions)) {
             assertFalse(files.anyMatch(Files::isRegularFile));
@@ -358,6 +528,54 @@ class NbtProfileStoreTest {
     }
 
     @Test
+    void preparedLoginRecoveryRestoresCanonicalBeforeImageInsteadOfUnknownLiveState() throws Exception {
+        UUID playerId = UUID.randomUUID();
+        ProfileKey lobby = key(playerId, "minecraft:lobby", "inventory_contents");
+        NbtProfileStore writer = new NbtProfileStore(temporaryDirectory, 5, 32);
+        CompoundTag canonicalLobby = new CompoundTag();
+        canonicalLobby.putString("marker", "empty-lobby");
+        writer.save(lobby, canonicalLobby, writer.nextRevision(playerId));
+
+        CompoundTag foreignLoginLive = new CompoundTag();
+        foreignLoginLive.putString("marker", "private-world-items");
+        long interruptedRevision = writer.nextRevision(playerId);
+        writer.writeRevision(
+                playerId,
+                interruptedRevision,
+                preparedLoginJournal(lobby, foreignLoginLive, canonicalLobby, true));
+        writer.close();
+
+        NbtProfileStore recovered = new NbtProfileStore(temporaryDirectory, 5, 32);
+        assertTrue(recovered.requiresCanonicalRecovery(playerId));
+        assertEquals(
+                "empty-lobby",
+                recovered.load(lobby).orElseThrow().payload().getString("marker"));
+        assertEquals(
+                "rolled_back",
+                recovered.loadRevision(playerId, interruptedRevision).orElseThrow().getString("status"));
+    }
+
+    @Test
+    void preparedLoginRecoveryDoesNotCreateAnAbsentTargetFromUnknownLiveState() throws Exception {
+        UUID playerId = UUID.randomUUID();
+        ProfileKey lobby = key(playerId, "minecraft:lobby", "inventory_contents");
+        NbtProfileStore writer = new NbtProfileStore(temporaryDirectory, 5, 32);
+        CompoundTag foreignLoginLive = new CompoundTag();
+        foreignLoginLive.putString("marker", "private-world-items");
+        long interruptedRevision = writer.nextRevision(playerId);
+        writer.writeRevision(
+                playerId,
+                interruptedRevision,
+                preparedLoginJournal(lobby, foreignLoginLive, null, false));
+        writer.close();
+
+        NbtProfileStore recovered = new NbtProfileStore(temporaryDirectory, 5, 32);
+        assertTrue(recovered.requiresCanonicalRecovery(playerId));
+        assertTrue(recovered.shouldResetLive(lobby));
+        assertTrue(recovered.load(lobby).isEmpty());
+    }
+
+    @Test
     void profileEnvelopeDetectsMetadataTampering() throws Exception {
         UUID playerId = UUID.randomUUID();
         ProfileKey key = key(playerId, "minecraft:overworld", "inventory_contents");
@@ -412,10 +630,110 @@ class NbtProfileStoreTest {
         }
     }
 
+    @Test
+    void invalidationMaintainsEntryAndByteAccountingAndReloadsDiskState() throws Exception {
+        UUID playerId = UUID.randomUUID();
+        UUID otherPlayer = UUID.randomUUID();
+        ProfileKey first = key(playerId, "minecraft:overworld", "advancements");
+        ProfileKey second = key(playerId, "minecraft:the_nether", "advancements");
+        ProfileKey other = key(otherPlayer, "minecraft:overworld", "advancements");
+        NbtProfileStore store = new NbtProfileStore(temporaryDirectory, 5, 32);
+        CompoundTag original = new CompoundTag();
+        original.putString("marker", "original");
+        store.save(first, original, store.nextRevision(playerId));
+        store.save(second, original, store.nextRevision(playerId));
+        store.save(other, original, store.nextRevision(otherPlayer));
+        CacheStats populated = store.cacheStats();
+
+        store.invalidate(first);
+        assertEquals(populated.entries() - 1, store.cacheStats().entries());
+        assertTrue(store.cacheStats().bytes() < populated.bytes());
+        store.invalidatePlayer(playerId);
+        assertEquals(1, store.cacheStats().entries());
+        assertTrue(store.load(other).isPresent());
+
+        NbtProfileStore externalWriter = new NbtProfileStore(temporaryDirectory, 5, 32);
+        CompoundTag updated = new CompoundTag();
+        updated.putString("marker", "updated");
+        externalWriter.save(first, updated, externalWriter.nextRevision(playerId));
+        store.invalidatePlayer(playerId);
+        assertEquals("updated", store.load(first).orElseThrow().payload().getString("marker"));
+        assertTrue(store.cacheStats().bytes() >= 0L);
+    }
+
+    @Test
+    void inspectionHasNoDiskRevisionOrCacheSideEffects() throws Exception {
+        UUID playerId = UUID.randomUUID();
+        ProfileKey key = key(playerId, "minecraft:overworld", "advancements");
+        NbtProfileStore store = new NbtProfileStore(temporaryDirectory, 5, 32);
+        CompoundTag payload = new CompoundTag();
+        payload.putString("marker", "inspect");
+        long revision = store.nextRevision(playerId);
+        store.save(key, payload, revision);
+        store.invalidatePlayer(playerId);
+        CacheStats before = store.cacheStats();
+        Path profile = onlyProfileFile();
+        java.nio.file.attribute.FileTime modified = Files.getLastModifiedTime(profile);
+
+        Map<ProfileKey, StoredProfile> inspected = store.inspectPlayerProfiles(playerId);
+
+        assertEquals("inspect", inspected.get(key).payload().getString("marker"));
+        assertEquals(before, store.cacheStats());
+        assertEquals(modified, Files.getLastModifiedTime(profile));
+        assertEquals(revision + 1L, store.nextRevision(playerId));
+    }
+
+    @Test
+    void compatibilityArchiveFailureLeavesSourceProfileUnchanged() throws Exception {
+        UUID playerId = UUID.randomUUID();
+        ProfileKey key = key(playerId, "minecraft:overworld", "advancements");
+        CompoundTag original = new CompoundTag();
+        original.putString("marker", "original");
+        NbtProfileStore initial = new NbtProfileStore(temporaryDirectory, 5, 32);
+        initial.save(key, original, initial.nextRevision(playerId));
+        initial.close();
+
+        NbtProfileStore.FaultInjector failCompatibilityArchive = new NbtProfileStore.FaultInjector() {
+            @Override
+            public void beforeWrite(Path temporary, Path destination, int bytes) throws java.io.IOException {
+                if (destination.toString().contains("archives"
+                        + java.io.File.separator + "compatibility")) {
+                    throw new java.io.IOException("injected compatibility archive failure");
+                }
+            }
+        };
+        NbtProfileStore store = new NbtProfileStore(
+                temporaryDirectory, 5, 32, 16, failCompatibilityArchive);
+
+        assertThrows(java.io.IOException.class,
+                () -> store.archive(key, "compatibility", "registry drift", 2L));
+        store.invalidate(key);
+        assertEquals("original", store.load(key).orElseThrow().payload().getString("marker"));
+    }
+
     private Path onlyProfileFile() throws Exception {
         try (var files = Files.walk(temporaryDirectory.resolve("data/mwi/profiles"))) {
             return files.filter(path -> path.getFileName().toString().endsWith(".dat"))
                     .findFirst().orElseThrow();
+        }
+    }
+
+    private static <T> T get(Future<T> future) {
+        try {
+            return future.get(5, TimeUnit.SECONDS);
+        } catch (Exception failure) {
+            throw new AssertionError(failure);
+        }
+    }
+
+    private static void await(CountDownLatch latch) throws java.io.IOException {
+        try {
+            if (!latch.await(10, TimeUnit.SECONDS)) {
+                throw new java.io.IOException("test latch timed out");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new java.io.IOException("test interrupted", interrupted);
         }
     }
 
@@ -436,6 +754,28 @@ class NbtProfileStoreTest {
         change.put("from_key", encodedKey(from));
         change.put("to_key", encodedKey(to));
         change.put("before", before.copy());
+        changes.add(change);
+        journal.put("changes", changes);
+        return journal;
+    }
+
+    private static CompoundTag preparedLoginJournal(
+            ProfileKey target,
+            CompoundTag liveBefore,
+            CompoundTag canonicalBefore,
+            boolean targetExisted) {
+        CompoundTag journal = new CompoundTag();
+        journal.putString("status", "prepared");
+        journal.putString("reason", "login");
+        ListTag changes = new ListTag();
+        CompoundTag change = new CompoundTag();
+        change.putString("share_id", target.shareId());
+        change.put("to_key", encodedKey(target));
+        change.put("before", liveBefore.copy());
+        change.putBoolean("target_existed", targetExisted);
+        if (canonicalBefore != null) {
+            change.put("canonical_before", canonicalBefore.copy());
+        }
         changes.add(change);
         journal.put("changes", changes);
         return journal;

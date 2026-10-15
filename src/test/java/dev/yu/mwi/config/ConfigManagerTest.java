@@ -28,6 +28,7 @@ class ConfigManagerTest {
         assertTrue(text.contains("io_concurrency = 2"));
         assertTrue(text.contains("queue_capacity = 256"));
         assertTrue(text.contains("flush_timeout_seconds = 30"));
+        assertTrue(text.contains("missing_item_policy = \"quarantine_and_continue\""));
         assertFalse(text.contains("announce_advancements"));
         assertEquals(defaults, new ConfigManager(temporaryDirectory).reload());
     }
@@ -119,5 +120,70 @@ class ConfigManagerTest {
                 "restore_last_location = false", "restore_last_location = true"));
 
         assertTrue(manager.reload().model().shareHandling().restoreLastLocation());
+    }
+
+    @Test
+    void loadsValidatedAdvancementAndCriterionAliases() throws Exception {
+        ConfigManager manager = new ConfigManager(temporaryDirectory);
+        manager.loadOrCreate();
+        String configured = Files.readString(manager.file())
+                + "\n[advancement_migration.aliases]\n"
+                + "\"trailandtales_delight:tat_delight\" = "
+                + "\"minecraft:trailandtales_delightmain/tat_delight\"\n"
+                + "\n[advancement_migration.criterion_aliases."
+                + "\"minecraft:trailandtales_delightmain/tat_delight\"]\n"
+                + "old_criterion = \"trail_and_tales\"\n";
+        Files.writeString(manager.file(), configured);
+
+        RuntimeConfig loaded = manager.reload();
+        MwiConfig.AdvancementMigration migration = loaded.model().advancementMigration();
+        net.minecraft.resources.ResourceLocation target = net.minecraft.resources.ResourceLocation.parse(
+                "minecraft:trailandtales_delightmain/tat_delight");
+        assertEquals(target, migration.resolveAdvancement(net.minecraft.resources.ResourceLocation.parse(
+                "trailandtales_delight:tat_delight")));
+        assertEquals("trail_and_tales", migration.resolveCriterion(target, "old_criterion"));
+        manager.replace(loaded);
+        assertEquals(loaded, new ConfigManager(temporaryDirectory).reload());
+    }
+
+    @Test
+    void rejectsInvalidAndCyclicAdvancementAliases() throws Exception {
+        ConfigManager manager = new ConfigManager(temporaryDirectory);
+        manager.loadOrCreate();
+        Files.writeString(manager.file(), Files.readString(manager.file())
+                + "\n[advancement_migration.aliases]\n\"not valid\" = \"minecraft:target\"\n");
+        assertThrows(ConfigException.class, manager::loadCandidate);
+
+        manager.replace(RuntimeConfig.defaults());
+        Files.writeString(manager.file(), Files.readString(manager.file())
+                + "\n[advancement_migration.aliases]\n"
+                        + "\"example:first\" = \"example:second\"\n"
+                        + "\"example:second\" = \"example:first\"\n");
+        assertThrows(ConfigException.class, manager::loadCandidate);
+    }
+
+    @Test
+    void loadsAndValidatesItemMigrationPolicyAndAliases() throws Exception {
+        ConfigManager manager = new ConfigManager(temporaryDirectory);
+        manager.loadOrCreate();
+        Files.writeString(manager.file(), Files.readString(manager.file())
+                .replace("missing_item_policy = \"quarantine_and_continue\"",
+                        "missing_item_policy = \"strict_fail\"")
+                + "\n[item_migration.aliases]\n"
+                + "\"oldmod:old_item\" = \"minecraft:stone\"\n");
+
+        RuntimeConfig loaded = manager.reload();
+        assertEquals(MwiConfig.MissingItemPolicy.STRICT_FAIL,
+                loaded.model().itemMigration().missingItemPolicy());
+        assertEquals(net.minecraft.resources.ResourceLocation.parse("minecraft:stone"),
+                loaded.model().itemMigration().resolve(
+                        net.minecraft.resources.ResourceLocation.parse("oldmod:old_item")));
+
+        manager.replace(RuntimeConfig.defaults());
+        Files.writeString(manager.file(), Files.readString(manager.file())
+                + "\n[item_migration.aliases]\n"
+                + "\"example:first\" = \"example:second\"\n"
+                + "\"example:second\" = \"example:first\"\n");
+        assertThrows(ConfigException.class, manager::loadCandidate);
     }
 }

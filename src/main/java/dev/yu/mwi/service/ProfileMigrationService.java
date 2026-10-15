@@ -6,6 +6,7 @@ import dev.yu.mwi.domain.ProfileKey;
 import dev.yu.mwi.domain.ScopeKey;
 import dev.yu.mwi.domain.WorldIdentity;
 import dev.yu.mwi.storage.WorldProfile;
+import dev.yu.mwi.storage.StoredProfile;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -53,7 +54,7 @@ final class ProfileMigrationService {
                 ? selected.profile().payload()
                 : allowLiveCurrent ? livePayload.copy() : null;
         if (payload == null) {
-            return new MigrationResult(null, List.of());
+            return new MigrationResult(null, List.of(), null, null);
         }
 
         List<ProfileKey> archives = List.of();
@@ -67,7 +68,11 @@ final class ProfileMigrationService {
                         archives.size(), groupKey.shareId(), player.getUUID(), groupKey.scope().id());
             }
         }
-        return new MigrationResult(payload, archives);
+        return new MigrationResult(
+                payload,
+                archives,
+                selected == null ? null : selected.key(),
+                selected == null ? null : selected.profile());
     }
 
     private List<ProfileCandidate> candidates(
@@ -137,9 +142,16 @@ final class ProfileMigrationService {
         return distinct.size();
     }
 
-    record MigrationResult(CompoundTag payload, List<ProfileKey> archives) {
+    record MigrationResult(
+            CompoundTag payload,
+            List<ProfileKey> archives,
+            ProfileKey sourceKey,
+            StoredProfile sourceProfile) {
         MigrationResult {
             archives = List.copyOf(archives);
+            if ((sourceKey == null) != (sourceProfile == null)) {
+                throw new IllegalArgumentException("migration source key and profile must be present together");
+            }
         }
     }
 }
