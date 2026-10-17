@@ -34,7 +34,7 @@ class CorruptProfileIsolationTest {
             gzip.write(new byte[]{10, 0, 0, 116, 0, 1, 120, 0});
         }
         IOException readFailure = assertThrows(IOException.class, () -> AtomicNbtFile.read(path(bad)));
-        assertInstanceOf(net.minecraft.ReportedException.class, readFailure.getCause());
+        assertInstanceOf(net.minecraft.ReportedException.class, readFailure.getCause().getCause());
         byte[] original = Files.readAllBytes(path(bad));
         for (int restart = 0; restart < 2; restart++) {
             try (NbtProfileStore store = open()) {
@@ -49,7 +49,7 @@ class CorruptProfileIsolationTest {
             }
         }
         assertArrayEquals(original, Files.readAllBytes(path(bad)));
-        Path quarantine = world.resolve("data/mwi/quarantine").resolve(bad.playerId().toString());
+        Path quarantine = world.resolve("data/mwi/diagnostics/inputs").resolve(bad.playerId().toString());
         try (var files = Files.list(quarantine)) {
             Path archived = files.filter(p -> p.toString().endsWith(".bin")).findFirst().orElseThrow();
             assertArrayEquals(original, Files.readAllBytes(archived));

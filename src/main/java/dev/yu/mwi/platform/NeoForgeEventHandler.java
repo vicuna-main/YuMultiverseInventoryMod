@@ -47,6 +47,7 @@ public final class NeoForgeEventHandler {
     @SubscribeEvent
     public void onRegisterCommands(RegisterCommandsEvent event) {
         MwiCommands.register(event.getDispatcher(), controller);
+        dev.yu.mwi.command.AutomaticRecoveryCommands.register(event.getDispatcher(), controller);
         dev.yu.mwi.recovery.RecoveryCommands.register(event.getDispatcher());
     }
 
@@ -103,6 +104,7 @@ public final class NeoForgeEventHandler {
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onServerTick(ServerTickEvent.Post event) {
         controller.flushPendingLogouts(event.getServer());
+        controller.tickOfflineRecovery();
         dev.yu.mwi.recovery.RecoveryNotifications.tick(event.getServer());
     }
 

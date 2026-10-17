@@ -159,6 +159,52 @@ tasks.named('test', Test).configure {
     useJUnitPlatform()
 }
 
+// Opt-in integration tests execute the real login/event/mixin path in a disposable server world.
+if (project.hasProperty('automaticRecoveryGameTests')) {
+    sourceSets {
+        gameTest {
+            compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+            runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+        }
+    }
+    runs.gameTestServer {
+        modSource project.sourceSets.gameTest
+        workingDirectory project.file(project.findProperty('recoveryGameDir') ?: 'build/automatic-recovery-gametest')
+        systemProperty 'neoforge.gameTestServer', 'true'
+        systemProperty 'forge.logging.console.level', 'info'
+        jvmArgument '-Xmx2G'
+    }
+    def generatedTests = layout.buildDirectory.dir('generated/automatic-recovery-tests')
+    sourceSets.gameTest.resources.srcDir(generatedTests)
+    def structure = tasks.register('generateRecoveryTestStructure') {
+        def output = generatedTests.map { it.file('data/yu_multiverse_inventory/structure/empty.nbt') }
+        outputs.file(output)
+        doLast {
+            File target = output.get().asFile
+            target.parentFile.mkdirs()
+            new DataOutputStream(new java.util.zip.GZIPOutputStream(new FileOutputStream(target))).withCloseable { nbt ->
+                nbt.writeByte(10); nbt.writeUTF('')
+                nbt.writeByte(3); nbt.writeUTF('DataVersion'); nbt.writeInt(3955)
+                nbt.writeByte(9); nbt.writeUTF('size'); nbt.writeByte(3); nbt.writeInt(3)
+                [5, 4, 5].each { nbt.writeInt(it) }
+                nbt.writeByte(9); nbt.writeUTF('palette'); nbt.writeByte(10); nbt.writeInt(1)
+                nbt.writeByte(8); nbt.writeUTF('Name'); nbt.writeUTF('minecraft:air'); nbt.writeByte(0)
+                ['blocks', 'entities'].each { nbt.writeByte(9); nbt.writeUTF(it); nbt.writeByte(10); nbt.writeInt(0) }
+                nbt.writeByte(0)
+            }
+        }
+    }
+    tasks.named('processGameTestResources') { dependsOn(structure) }
+    tasks.matching { it.name == 'runGameTestServer' }.configureEach {
+        doLast {
+            File log = project.file((project.findProperty('recoveryGameDir') ?: 'build/automatic-recovery-gametest') + '/logs/latest.log')
+            String receipt = log.isFile() ? log.getText('UTF-8') : ''
+            if (!(receipt =~ /All [1-9][0-9]* required tests passed/))
+                throw new GradleException("GameTest success receipt missing: ${log}")
+        }
+    }
+}
+
 // This block of code expands all declared replace properties in the specified resource targets.
 // A missing property will result in an error. Properties are expanded using ${} Groovy notation.
 // When "copyIdeResources" is enabled, this will also run before the game launches in IDE environments.

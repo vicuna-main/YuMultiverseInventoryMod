@@ -6,6 +6,7 @@ import net.minecraft.nbt.NbtIo;
 
 import java.io.IOException;
 import java.io.ByteArrayOutputStream;
+import java.io.ByteArrayInputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -30,7 +31,56 @@ final class AtomicNbtFile {
     }
 
     private static CompoundTag read(Path file, long maxBytes) throws IOException {
-        try (var input = new java.util.zip.GZIPInputStream(Files.newInputStream(file));
+        return snapshot(file, maxBytes).parse();
+    }
+
+    static Snapshot snapshot(Path file, boolean transaction) throws IOException {
+        return snapshot(file, transaction ? MAX_TRANSACTION_BYTES : MAX_NBT_BYTES);
+    }
+
+    private static Snapshot snapshot(Path file, long limit) throws IOException {
+        // Bound the compressed input too; NbtAccounter only limits the decoded object graph.
+        try (var input = Files.newInputStream(file)) {
+            byte[] bytes = input.readNBytes(Math.toIntExact(limit + 1));
+            if (bytes.length > limit) {
+                throw new ProfileCorruptionException(file, "Compressed NBT exceeds input limit");
+            }
+            return new Snapshot(file, bytes, limit);
+        }
+    }
+
+    record Snapshot(Path file, byte[] bytes, long limit) {
+        String sha256() {
+            try {
+                return java.util.HexFormat.of().formatHex(
+                        java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
+            } catch (java.security.NoSuchAlgorithmException impossible) {
+                throw new IllegalStateException(impossible);
+            }
+        }
+
+        CompoundTag parse() throws IOException {
+            try {
+                return parseBytes(file, bytes, limit);
+            } catch (IOException failure) {
+                throw new SnapshotFailure(this, failure);
+            }
+        }
+    }
+
+    static final class SnapshotFailure extends IOException {
+        private final Snapshot snapshot;
+
+        SnapshotFailure(Snapshot snapshot, IOException cause) {
+            super(cause.getMessage(), cause);
+            this.snapshot = snapshot;
+        }
+
+        Snapshot snapshot() { return snapshot; }
+    }
+
+    private static CompoundTag parseBytes(Path file, byte[] bytes, long maxBytes) throws IOException {
+        try (var input = new java.util.zip.GZIPInputStream(new ByteArrayInputStream(bytes));
              var data = new java.io.DataInputStream(new java.io.BufferedInputStream(input))) {
             CompoundTag result = NbtIo.read(data, NbtAccounter.create(maxBytes));
             // NBT parsing stops at TAG_End. Read through EOF to validate the gzip trailer/CRC.

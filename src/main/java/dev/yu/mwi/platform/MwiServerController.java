@@ -86,6 +86,7 @@ public final class MwiServerController {
         configManager = candidateManager;
         adapters = candidateAdapters;
         service = candidateService;
+        RecoveryLoginFence.register(startingServer, service);
         dev.yu.mwi.api.RecoveryBridgeV1.register(startingServer, service.recoveryCenter());
         pendingLogouts.clear();
         logger.info("Yu Multiverse Inventory started with {} adapters and {} world groups",
@@ -103,6 +104,7 @@ public final class MwiServerController {
             service.close();
         } finally {
             dev.yu.mwi.api.RecoveryBridgeV1.unregister(stoppingServer);
+            RecoveryLoginFence.unregister(stoppingServer);
             pendingLogouts.clear();
             service = null;
             adapters = null;
@@ -113,7 +115,7 @@ public final class MwiServerController {
     }
 
     public void login(ServerPlayer player) throws TransitionException {
-        pendingLogouts.remove(player.getUUID());
+        pendingLogouts.remove(player.getUUID(), player);
         requireService(player.server).login(player);
     }
 
@@ -138,6 +140,8 @@ public final class MwiServerController {
     public void invalidateRecoveryConfirmation(ServerPlayer player) {
         if (service != null && server == player.server) service.invalidateRecoveryConfirmation(player);
     }
+
+    public void tickOfflineRecovery() { if (service != null) service.tickOfflineRecovery(); }
 
     /** Defers logout persistence until SaveToFile, after hybrid-server quit handlers have run. */
     public void markLogoutPending(ServerPlayer player) {

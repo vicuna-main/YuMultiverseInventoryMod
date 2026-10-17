@@ -35,7 +35,13 @@ public record RuntimeConfig(
             int cacheMegabytes,
             int ioConcurrency,
             int queueCapacity,
-            int flushTimeoutSeconds) {
+            int flushTimeoutSeconds,
+            boolean automaticRecovery,
+            int recoveryRetrySeconds) {
+        public Storage(int maxRevisions, int cacheEntries, int cacheMegabytes, int ioConcurrency,
+                int queueCapacity, int flushTimeoutSeconds) {
+            this(maxRevisions, cacheEntries, cacheMegabytes, ioConcurrency, queueCapacity, flushTimeoutSeconds, true, 30);
+        }
         public Storage(int maxRevisions, int cacheEntries, int cacheMegabytes) {
             this(maxRevisions, cacheEntries, cacheMegabytes, 2, 256, 30);
         }
@@ -60,6 +66,8 @@ public record RuntimeConfig(
             if (flushTimeoutSeconds < 1 || flushTimeoutSeconds > 300) {
                 throw new IllegalArgumentException("storage.flush_timeout_seconds must be between 1 and 300");
             }
+            if (recoveryRetrySeconds < 5 || recoveryRetrySeconds > 3600)
+                throw new IllegalArgumentException("storage.recovery_retry_seconds must be between 5 and 3600");
         }
 
         public static Storage defaults() {

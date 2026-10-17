@@ -51,6 +51,12 @@ public final class NbtProfileStore implements ProfileStore {
     private final FaultInjector faultInjector;
     private final Map<UUID, RevisionState> revisionStates = new ConcurrentHashMap<>();
     private final Map<UUID, ProfileCorruptionException> blockedPlayers = new ConcurrentHashMap<>();
+    private final Map<ProfileKey, ProfileCorruptionException> blockedProfiles = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> recoveryGenerations = new ConcurrentHashMap<>();
+    private final ThreadLocal<UUID> recoveryOwner = new ThreadLocal<>();
+    private final ThreadLocal<Boolean> recoveryRecording = new ThreadLocal<>();
+    private final Map<UUID, Map<Path, IOException>> pendingEvidence = new ConcurrentHashMap<>();
+    private final RecoveryIncidentJournal incidents;
     private final Map<UUID, Path> pendingPlayers = new ConcurrentHashMap<>();
     private final Map<UUID, ReentrantLock> persistenceLocks = new ConcurrentHashMap<>();
     private final Map<UUID, java.util.Set<ProfileKey>> startupResetTargets = new ConcurrentHashMap<>();
@@ -91,6 +97,7 @@ public final class NbtProfileStore implements ProfileStore {
         this.maxCacheEntries = maxCacheEntries;
         this.maxCacheBytes = Math.multiplyExact((long) maxCacheMegabytes, 1024L * 1024L);
         this.faultInjector = java.util.Objects.requireNonNull(faultInjector, "faultInjector");
+        this.incidents = new RecoveryIncidentJournal(root, faultInjector);
         this.cache = new WeightedLruCache<>(maxCacheEntries, maxCacheBytes);
         Files.createDirectories(root);
         loadQuarantineMarkers();
@@ -115,6 +122,8 @@ public final class NbtProfileStore implements ProfileStore {
 
     private Optional<StoredProfile> loadLocked(ProfileKey key) throws IOException {
         requireHealthyPlayer(key.playerId());
+        if (!key.playerId().equals(recoveryOwner.get()) && blockedProfiles.containsKey(key))
+            throw blockedProfiles.get(key);
         StoredProfile cached = cache.get(java.util.Objects.requireNonNull(key, "key"));
         if (cached != null) {
             return Optional.of(copy(cached));
@@ -218,11 +227,7 @@ public final class NbtProfileStore implements ProfileStore {
             return SaveResult.UNCHANGED;
         }
 
-        Instant now = Instant.now();
-        CompoundTag document = profileDocument(key, storedPayload, revision, now, checksum);
-        AtomicNbtFile.write(profilePath(key), document);
-        putCache(key, new StoredProfile(payload, revision, now, checksum), digest.canonicalBytes());
-        advanceRevisionCounter(key.playerId(), revision);
+        commitBatch(key.playerId(), revision, Map.of(key, storedPayload), Optional.empty());
         return SaveResult.WRITTEN;
     }
 
@@ -363,6 +368,10 @@ public final class NbtProfileStore implements ProfileStore {
     public void delete(ProfileKey key) throws IOException {
         ReentrantLock lock = acquirePersistenceLock(key.playerId());
         try {
+            if (blockedProfiles.containsKey(key)) throw blockedProfiles.get(key);
+            requireNoPendingWrites(key.playerId());
+            // A deleted key must never be resurrected by its retained after-image.
+            removeRecoveryHead(key);
             Files.deleteIfExists(profilePath(key));
             removeCache(key);
         } finally {
@@ -383,7 +392,8 @@ public final class NbtProfileStore implements ProfileStore {
 
     @Override
     public long nextRevision(UUID playerId) {
-        if (blockedPlayers.containsKey(playerId)) {
+        if (blockedPlayers.containsKey(playerId) || (!revisionStates.containsKey(playerId)
+                && blockedProfiles.keySet().stream().anyMatch(key -> key.playerId().equals(playerId)))) {
             throw new IllegalStateException("MWI player data is quarantined: " + playerId, blockedPlayers.get(playerId));
         }
         RevisionState state = revisionStates.computeIfAbsent(
@@ -414,6 +424,9 @@ public final class NbtProfileStore implements ProfileStore {
         document.put("journal", journal.copy());
         addDocumentChecksum(document, "revision");
         AtomicNbtFile.write(revisionPath(playerId, revision), document);
+        if (java.util.Set.of("committed", "rolled_back").contains(journal.getString("status"))) {
+            AtomicNbtFile.write(completedRevisionPath(playerId, revision), document, faultInjector);
+        }
         pruneRevisions(playerId);
     }
 
@@ -621,6 +634,11 @@ public final class NbtProfileStore implements ProfileStore {
 
     private DecodedProfile decodeProfile(
             Path file, ProfileKey key, CompoundTag document, boolean migrateMetadata) throws IOException {
+        return decodeProfile(file, key, document, migrateMetadata, null);
+    }
+
+    private DecodedProfile decodeProfile(
+            Path file, ProfileKey key, CompoundTag document, boolean migrateMetadata, byte[] input) throws IOException {
         if (document.getInt("schema_version") != SCHEMA_VERSION) {
             throw new ProfileCorruptionException(file, "Unsupported profile schema " + document.getInt("schema_version"));
         }
@@ -652,7 +670,8 @@ public final class NbtProfileStore implements ProfileStore {
             boolean verifiedByReserialization = expected.equals(NbtChecksums.legacySha256(payload));
             boolean verifiedByStoredBytes = false;
             if (!verifiedByReserialization) {
-                verifiedByStoredBytes = expected.equals(NbtChecksums.legacySha256OfStoredPayload(file));
+                verifiedByStoredBytes = expected.equals(input == null ? NbtChecksums.legacySha256OfStoredPayload(file)
+                        : NbtChecksums.legacySha256OfStoredPayload(input));
             }
             if (!verifiedByReserialization && !verifiedByStoredBytes) {
                 throw new ProfileCorruptionException(file, "Profile checksum mismatch");
@@ -1037,18 +1056,25 @@ public final class NbtProfileStore implements ProfileStore {
             faultInjector.beforeProfileApply(key, index);
             Path destination = profilePath(key);
             if (!trusted && Files.isRegularFile(destination)) {
-                DecodedProfile installed = readCanonicalProfile(destination, key, false);
-                long installedRevision = installed.profile().revision();
-                if (installedRevision > revision) {
-                    continue;
-                }
-                if (installedRevision == revision
-                        && installed.profile().checksum().equals(document.getString("checksum"))) {
-                    putCache(key, installed.profile(), installed.canonicalBytes());
-                    continue;
+                try {
+                    DecodedProfile installed = readCanonicalProfile(destination, key, false);
+                    long installedRevision = installed.profile().revision();
+                    if (installedRevision > revision) continue;
+                    if (installedRevision == revision
+                            && installed.profile().checksum().equals(document.getString("checksum"))) {
+                        putCache(key, installed.profile(), installed.canonicalBytes());
+                        continue;
+                    }
+                } catch (ProfileCorruptionException damaged) {
+                    CompoundTag head = recoveryHead(key);
+                    long knownRevision = head == null ? durableCounterForRecovery(playerId) : head.getLong("revision");
+                    if (knownRevision > revision) throw damaged;
+                    // The already durable WAL owns this whole batch. Its retained, verified
+                    // after-image is authoritative, not a best-effort older backup.
                 }
             }
             AtomicNbtFile.write(destination, document, faultInjector);
+            decodeProfile(destination, key, AtomicNbtFile.read(destination), false);
             if (trusted) {
                 long canonicalBytes = write.getLong("canonical_bytes");
                 requireProfileSize(canonicalBytes);
@@ -1069,7 +1095,9 @@ public final class NbtProfileStore implements ProfileStore {
         if (transaction.contains("recovery")) {
             applyRecovery(transactionFile, transaction.getCompound("recovery"), playerId, revision);
         }
+        retainCommittedTransaction(transaction);
         AtomicNbtFile.deleteDurably(transactionFile);
+        pendingPlayers.remove(playerId, transactionFile);
     }
 
     @Override
@@ -1570,17 +1598,25 @@ public final class NbtProfileStore implements ProfileStore {
 
     private DecodedProfile readCanonicalProfile(Path file, ProfileKey key, boolean migrate) throws IOException {
         try {
-            CompoundTag document = AtomicNbtFile.read(file);
+            AtomicNbtFile.Snapshot snapshot = AtomicNbtFile.snapshot(file, false);
+            faultInjector.afterSnapshot(file, snapshot.bytes());
+            CompoundTag document = snapshot.parse();
             // Verify the entire envelope before any legacy metadata rewrite.
-            DecodedProfile decoded = decodeProfile(file, key, document, false);
-            return migrate ? decodeProfile(file, key, document, true) : decoded;
+            DecodedProfile decoded;
+            try {
+                decoded = decodeProfile(file, key, document, false, snapshot.bytes());
+            } catch (IOException failure) {
+                throw new AtomicNbtFile.SnapshotFailure(snapshot, failure);
+            }
+            return migrate ? decodeProfile(file, key, document, true, snapshot.bytes()) : decoded;
         } catch (IOException failure) {
             blockPlayer(key.playerId(), file, failure);
-            throw blockedPlayers.get(key.playerId());
+            throw blockedProfiles.getOrDefault(key, new ProfileCorruptionException(file, "Profile unavailable", failure));
         }
     }
 
     private void requireHealthyPlayer(UUID playerId) throws ProfileCorruptionException {
+        if (playerId.equals(recoveryOwner.get())) return;
         ProfileCorruptionException failure = blockedPlayers.get(playerId);
         if (failure != null) {
             throw failure;
@@ -1588,11 +1624,541 @@ public final class NbtProfileStore implements ProfileStore {
     }
 
     private void requireNoPendingWrites(UUID playerId) throws ProfileCorruptionException {
+        if (playerId.equals(recoveryOwner.get())) return;
         Path pending = pendingPlayers.get(playerId);
         if (pending != null) throw new ProfileCorruptionException(pending, "A durable transaction requires restart recovery");
+        if (Files.exists(repairPlanPath(playerId)))
+            throw new ProfileCorruptionException(repairPlanPath(playerId), "Exact recovery is not yet verified");
+    }
+
+    @Override
+    public long recoveryGeneration(UUID playerId) { return recoveryGenerations.getOrDefault(playerId, 0L); }
+
+    @Override
+    public java.util.Set<UUID> recoveryCandidates() {
+        java.util.Set<UUID> owners = new HashSet<>(blockedPlayers.keySet());
+        blockedProfiles.keySet().forEach(key -> owners.add(key.playerId()));
+        owners.addAll(pendingPlayers.keySet());
+        return java.util.Set.copyOf(owners);
+    }
+
+    @Override
+    public void preserveRecoverySession(UUID playerId, UUID sessionId, CompoundTag adapters) throws IOException {
+        incidents.preserveLive(playerId, sessionId, adapters);
+    }
+
+    /** Private recovery entry bypasses only the business lock; every byte/identity check still runs. */
+    @Override
+    public RecoveryInspection inspectRecovery(UUID playerId, boolean repair) throws IOException {
+        ReentrantLock lock = persistenceLocks.computeIfAbsent(playerId, ignored -> new ReentrantLock());
+        if (!lock.tryLock()) throw new IOException("Player persistence is still draining");
+        recoveryOwner.set(playerId);
+        recoveryRecording.set(repair);
+        try {
+            if (repair) flushPendingEvidence(playerId);
+            LinkedHashMap<ProfileKey, StoredProfile> healthy = new LinkedHashMap<>();
+            LinkedHashMap<ProfileKey, String> unavailable = new LinkedHashMap<>();
+            List<String> pending = new ArrayList<>();
+            long reserved = 0;
+            for (Path file : playerDocuments("transactions", playerId)) {
+                reserved = Math.max(reserved, checkedRevision(file));
+                try {
+                    CompoundTag transaction = readStableDocument(file, true, doc -> {
+                        if (!doc.hasUUID("player_uuid") || !playerId.equals(doc.getUUID("player_uuid"))
+                                || !transactionPath(playerId, doc.getLong("revision")).equals(file))
+                            throw new ProfileCorruptionException(file, "Transaction path identity mismatch");
+                        verifyTransaction(file, doc);
+                    });
+                    if (!transactionPath(playerId, transaction.getLong("revision")).equals(file)
+                            || !playerId.equals(transaction.getUUID("player_uuid")))
+                        throw new ProfileCorruptionException(file, "Transaction path identity mismatch");
+                    verifyTransaction(file, transaction);
+                    if (!repair) { pending.add("Unfinished transaction: " + file.getFileName()); continue; }
+                    applyPendingTransaction(file, transaction, false);
+                    incidents.resolved(playerId, file, "Completed durable transaction");
+                } catch (IOException failure) {
+                    if (repair) blockPlayer(playerId, file, failure);
+                    pending.add("Transaction unavailable: " + file.getFileName());
+                }
+            }
+            if (Files.exists(repairPlanPath(playerId))) {
+                try {
+                    if (repair) applyExactRepair(playerId);
+                    else pending.add("Unfinished exact recovery");
+                } catch (IOException failure) { pending.add("Exact recovery pending: " + failure.getMessage()); }
+            }
+            for (Path file : playerDocuments("revisions", playerId)) {
+                reserved = Math.max(reserved, checkedRevision(file));
+                try {
+                    CompoundTag document;
+                    try { document = readRevisionForRecovery(playerId, file); }
+                    catch (IOException failure) {
+                        if (repair) blockPlayer(playerId, file, failure);
+                        Path copy = completedRevisionPath(playerId, checkedRevision(file));
+                        if (!repair || !Files.exists(copy)) throw failure;
+                        CompoundTag completed = readRevisionForRecovery(playerId, copy);
+                        if (!java.util.Set.of("committed", "rolled_back").contains(
+                                completed.getCompound("journal").getString("status"))) throw failure;
+                        AtomicNbtFile.write(file, completed, faultInjector);
+                        document = readRevisionForRecovery(playerId, file);
+                    }
+                    CompoundTag journal = document.getCompound("journal");
+                    if ("prepared".equals(journal.getString("status"))) {
+                        if (!repair || !pending.isEmpty()) { pending.add("Prepared revision: " + file.getFileName()); continue; }
+                        LinkedHashMap<ProfileKey, CompoundTag> rollback = new LinkedHashMap<>();
+                        decodePreparedRollback(file, playerId, journal, rollback,
+                                startupResetTargets.computeIfAbsent(playerId, ignored -> new HashSet<>()));
+                        journal.putString("status", "rolled_back");
+                        journal.putString("error", "Automatic recovery completed the interrupted transition");
+                        commitBatch(playerId, document.getLong("revision"), rollback, Optional.of(journal));
+                        canonicalRecoveryPlayers.add(playerId);
+                    } else if (!java.util.Set.of("committed", "rolled_back").contains(journal.getString("status"))) {
+                        throw new ProfileCorruptionException(file, "Unknown revision completion state");
+                    }
+                    if (repair) incidents.resolved(playerId, file, "Revision and transaction dependencies verified");
+                } catch (IOException failure) {
+                    if (repair) blockPlayer(playerId, file, failure);
+                    pending.add("Revision unavailable: " + file.getFileName());
+                }
+            }
+            java.util.Set<ProfileKey> keys = new java.util.LinkedHashSet<>();
+            Path directory = root.resolve("profiles").resolve(playerId.toString());
+            Path legacyDirectory = root.resolve("quarantine").resolve(playerId.toString());
+            if (Files.isDirectory(legacyDirectory)) try (var files = Files.list(legacyDirectory)) {
+                for (Path file : files.filter(p -> p.getFileName().toString().endsWith(".dat")).toList()) {
+                    CompoundTag receipt = readStableDocument(file, false);
+                    if (!receipt.hasUUID("player_uuid") || !playerId.equals(receipt.getUUID("player_uuid")))
+                        throw new ProfileCorruptionException(file, "Legacy quarantine owner mismatch");
+                    Path source = root.resolve(receipt.getString("source")).normalize();
+                    if (!source.startsWith(root) || receipt.getString("source").isBlank())
+                        throw new ProfileCorruptionException(file, "Invalid legacy quarantine source");
+                    Path relative = root.relativize(source);
+                    if (relative.getNameCount() < 2 || !java.util.Set.of("profiles", "revisions", "transactions")
+                            .contains(relative.getName(0).toString()) || !playerId.toString().equals(relative.getName(1).toString()))
+                        throw new ProfileCorruptionException(file, "Legacy incident references a different owner or category");
+                    if (source.startsWith(directory) && isCanonicalProfilePath(playerId, source)) keys.add(keyFromPath(playerId, source));
+                    else if (!Files.exists(source)) pending.add("Missing legacy incident source: " + receipt.getString("source"));
+                }
+            }
+            if (Files.isDirectory(directory)) try (var files = Files.walk(directory)) {
+                files.filter(Files::isRegularFile).filter(path -> isCanonicalProfilePath(playerId, path))
+                        .sorted().forEach(path -> keys.add(keyFromPath(playerId, path)));
+            }
+            keys.addAll(blockedProfiles.keySet().stream().filter(key -> key.playerId().equals(playerId)).toList());
+            for (Path source : incidents.unresolved(playerId)) {
+                if (source.startsWith(directory) && isCanonicalProfilePath(playerId, source)) keys.add(keyFromPath(playerId, source));
+            }
+            CompoundTag heads = readHeads(playerId);
+            for (Tag tag : heads.getList("profiles", Tag.TAG_COMPOUND)) keys.add(decodeKey(((CompoundTag) tag).getCompound("key")));
+            for (ProfileKey key : keys) {
+                try {
+                    DecodedProfile decoded = inspectStableProfile(key, repair);
+                    healthy.put(key, copy(decoded.profile()));
+                    reserved = Math.max(reserved, decoded.profile().revision());
+                    if (repair) {
+                        incidents.resolved(playerId, profilePath(key), "Current canonical input verified");
+                        blockedProfiles.remove(key);
+                    }
+                } catch (IOException failure) {
+                    unavailable.put(key, failure.getMessage());
+                    if (repair) blockPlayer(playerId, profilePath(key), failure);
+                }
+            }
+            if (repair && pending.isEmpty() && !unavailable.isEmpty()) {
+                prepareExactRepair(playerId, unavailable.keySet());
+                if (Files.exists(repairPlanPath(playerId))) applyExactRepair(playerId);
+                for (ProfileKey key : List.copyOf(unavailable.keySet())) {
+                    try {
+                        DecodedProfile decoded = inspectStableProfile(key);
+                        healthy.put(key, copy(decoded.profile()));
+                        reserved = Math.max(reserved, decoded.profile().revision());
+                        incidents.resolved(playerId, profilePath(key), "Verified exact committed after-image");
+                        blockedProfiles.remove(key);
+                        unavailable.remove(key);
+                    } catch (IOException stillDamaged) {
+                        unavailable.put(key, stillDamaged.getMessage());
+                    }
+                }
+            }
+            for (Path file : playerDocuments("committed_batches", playerId)) reserved = Math.max(reserved, checkedRevision(file));
+            long counter;
+            try { counter = durableCounterForRecovery(playerId); }
+            catch (IOException failure) {
+                if (!repair || !unavailable.isEmpty() || (keys.isEmpty() && reserved == 0)) throw failure;
+                incidents.failed(playerId, revisionCounterPath(playerId), failure);
+                counter = -1;
+            }
+            if (counter < 0 && !unavailable.isEmpty()) pending.add("Cannot prove revision high-water mark");
+            else {
+                reserved = Math.max(reserved, Math.max(0, counter));
+                reserved = Math.max(reserved, revisionStates.containsKey(playerId) ? revisionStates.get(playerId).allocated.get() : 0);
+                if (reserved == Long.MAX_VALUE) pending.add("Revision counter exhausted");
+                else if (repair) {
+                    if (reserved > counter) writeRevisionCounter(playerId, reserved);
+                    incidents.resolved(playerId, revisionCounterPath(playerId), "Verified profile/transaction high-water mark");
+                    revisionStates.computeIfAbsent(playerId, ignored -> new RevisionState(0)).markDurable(reserved);
+                }
+            }
+            Path legacy = root.resolve("quarantine").resolve(playerId.toString());
+            if (Files.isDirectory(legacy) && keys.isEmpty()) pending.add("Legacy isolation has no verifiable canonical profiles");
+            // A disappeared history/WAL must not become evidence that it successfully completed.
+            for (Path source : incidents.unresolved(playerId)) {
+                if (!source.startsWith(directory) && !Files.exists(source)) pending.add("Missing incident source: " + root.relativize(source));
+            }
+            if (repair && pending.isEmpty()) {
+                blockedPlayers.remove(playerId);
+                invalidatePlayer(playerId);
+                if (unavailable.isEmpty() && Files.isDirectory(legacy)) {
+                    // The durable resolution precedes the move; an interrupted move is safe to repeat.
+                    incidents.resolved(playerId, legacy, "All current profiles and transactions verified");
+                    Path archive = root.resolve("diagnostics/quarantine-archive").resolve(playerId.toString())
+                            .resolve("legacy-" + UUID.randomUUID());
+                    Files.createDirectories(archive.getParent());
+                    Files.move(legacy, archive, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                }
+            }
+            CompoundTag journal = incidents.read(playerId);
+            int attempts = journal.getList("incidents", Tag.TAG_COMPOUND).stream()
+                    .mapToInt(tag -> ((CompoundTag) tag).getInt("attempts")).sum();
+            recoveryGenerations.put(playerId, journal.getLong("generation"));
+            return new RecoveryInspection(journal.getLong("generation"), healthy, unavailable, pending, attempts,
+                    pending.isEmpty() && unavailable.isEmpty() ? "RESOLVED" : "WAITING_FOR_SOURCE");
+        } finally {
+            recoveryOwner.remove();
+            recoveryRecording.remove();
+            lock.unlock();
+        }
+    }
+
+    private DecodedProfile inspectStableProfile(ProfileKey key) throws IOException {
+        return inspectStableProfile(key, true);
+    }
+
+    private DecodedProfile inspectStableProfile(ProfileKey key, boolean record) throws IOException {
+        IOException last = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            AtomicNbtFile.Snapshot snapshot = null;
+            try {
+                snapshot = AtomicNbtFile.snapshot(profilePath(key), false);
+                faultInjector.afterSnapshot(profilePath(key), snapshot.bytes());
+                CompoundTag document = snapshot.parse();
+                DecodedProfile decoded = decodeProfile(profilePath(key), key, document, false, snapshot.bytes());
+                decodeProfile(profilePath(key), key, snapshot.parse(), false, snapshot.bytes());
+                if (!snapshot.sha256().equals(AtomicNbtFile.snapshot(profilePath(key), false).sha256()))
+                    throw new IOException("Profile input changed during verification");
+                return decoded;
+            } catch (IOException failure) {
+                last = snapshot == null || failure instanceof AtomicNbtFile.SnapshotFailure ? failure
+                        : new AtomicNbtFile.SnapshotFailure(snapshot, failure);
+                if (attempt == 0 && record) recordIncident(key.playerId(), profilePath(key), last);
+            }
+        }
+        throw last;
+    }
+
+    private CompoundTag readStableDocument(Path file, boolean transaction) throws IOException {
+        return readStableDocument(file, transaction, document -> { });
+    }
+
+    @FunctionalInterface
+    private interface DocumentValidator { void verify(CompoundTag document) throws IOException; }
+
+    private CompoundTag readStableDocument(Path file, boolean transaction, DocumentValidator validator) throws IOException {
+        IOException last = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            AtomicNbtFile.Snapshot input = null;
+            try {
+                input = AtomicNbtFile.snapshot(file, transaction);
+                faultInjector.afterSnapshot(file, input.bytes());
+                CompoundTag document = input.parse();
+                validator.verify(document);
+                validator.verify(input.parse());
+                if (!input.sha256().equals(AtomicNbtFile.snapshot(file, transaction).sha256()))
+                    throw new IOException("Input changed during verification: " + file);
+                if (Boolean.TRUE.equals(recoveryRecording.get()))
+                    incidents.resolved(recoveryOwner.get(), file, "Stable metadata input verified");
+                return document;
+            } catch (IOException failure) {
+                last = input == null || failure instanceof AtomicNbtFile.SnapshotFailure ? failure
+                        : new AtomicNbtFile.SnapshotFailure(input, failure);
+                if (attempt == 0 && Boolean.TRUE.equals(recoveryRecording.get()))
+                    recordIncident(recoveryOwner.get(), file, last);
+            }
+        }
+        throw last;
+    }
+
+    private CompoundTag readRevisionForRecovery(UUID owner, Path file) throws IOException {
+        return readStableDocument(file, false, document -> {
+            if (document.getInt("schema_version") != SCHEMA_VERSION || !document.hasUUID("player_uuid")
+                    || !owner.equals(document.getUUID("player_uuid")) || document.getLong("revision") != checkedRevision(file)
+                    || !document.contains("journal", Tag.TAG_COMPOUND))
+                throw new ProfileCorruptionException(file, "Revision identity mismatch");
+            verifyDocumentChecksum(file, document, "revision");
+        });
+    }
+
+    private static void verifyDocumentChecksum(Path file, CompoundTag document, String prefix) throws IOException {
+        String key = prefix + "_checksum";
+        if (!document.contains(key) || !DOCUMENT_ALGORITHM.equals(document.getString(prefix + "_checksum_algorithm")))
+            throw new ProfileCorruptionException(file, "Missing or unsupported " + prefix + " checksum");
+        CompoundTag copy = document.copy();
+        copy.remove(key);
+        if (!document.getString(key).equals(NbtChecksums.canonicalSha256(copy)))
+            throw new ProfileCorruptionException(file, prefix + " checksum mismatch");
+    }
+
+    private List<Path> playerDocuments(String category, UUID owner) throws IOException {
+        Path directory = root.resolve(category).resolve(owner.toString());
+        if (!Files.isDirectory(directory)) return List.of();
+        try (var files = Files.list(directory)) {
+            return files.filter(Files::isRegularFile).filter(file -> file.getFileName().toString().endsWith(".dat"))
+                    .sorted(Comparator.comparingLong(NbtProfileStore::transactionRevision)).toList();
+        }
+    }
+
+    private static long checkedRevision(Path file) throws IOException {
+        String name = file.getFileName().toString();
+        if (!name.matches("[1-9][0-9]{0,18}\\.dat")) throw new ProfileCorruptionException(file, "Invalid revision filename");
+        try {
+            long revision = Long.parseLong(name.substring(0, name.length() - 4));
+            if (revision == Long.MAX_VALUE) throw new NumberFormatException("Revision exhausted");
+            return revision;
+        } catch (NumberFormatException failure) { throw new ProfileCorruptionException(file, "Invalid revision range", failure); }
+    }
+
+    private long durableCounterForRecovery(UUID owner) throws IOException {
+        Path file = revisionCounterPath(owner);
+        if (!Files.exists(file)) return -1;
+        CompoundTag counter = readStableDocument(file, false, document -> {
+            if (document.getInt("schema_version") != SCHEMA_VERSION || !document.hasUUID("player_uuid")
+                    || !owner.equals(document.getUUID("player_uuid")) || document.getLong("revision") < 0)
+                throw new ProfileCorruptionException(file, "Invalid revision counter identity");
+            verifyDocumentChecksum(file, document, "counter");
+        });
+        return counter.getLong("revision");
+    }
+
+    private Path completedRevisionPath(UUID owner, long revision) {
+        return root.resolve("completed_revisions").resolve(owner.toString()).resolve(revision + ".dat");
+    }
+
+    private Path headsPath(UUID owner) { return root.resolve("committed_heads").resolve(owner + ".dat"); }
+    private Path committedPath(UUID owner, long revision) {
+        return root.resolve("committed_batches").resolve(owner.toString()).resolve(revision + ".dat");
+    }
+    private Path repairPlanPath(UUID owner) { return root.resolve("exact_repairs").resolve(owner + ".dat"); }
+
+    private CompoundTag readHeads(UUID owner) throws IOException {
+        Path file = headsPath(owner);
+        if (!Files.exists(file)) {
+            CompoundTag result = new CompoundTag();
+            result.putInt("schema_version", 1);
+            result.putUUID("player_uuid", owner);
+            result.put("profiles", new ListTag());
+            return result;
+        }
+        CompoundTag result = readStableDocument(file, false, document -> RecoveryIncidentJournal.verify(file, document));
+        if (result.getInt("schema_version") != 1 || !result.hasUUID("player_uuid") || !owner.equals(result.getUUID("player_uuid")))
+            throw new ProfileCorruptionException(file, "Committed heads identity mismatch");
+        java.util.Set<ProfileKey> unique = new HashSet<>();
+        for (Tag entry : result.getList("profiles", Tag.TAG_COMPOUND)) {
+            CompoundTag head = (CompoundTag) entry;
+            ProfileKey key = decodeKey(head.getCompound("key"));
+            if (!key.playerId().equals(owner) || !unique.add(key) || head.getLong("revision") < 1)
+                throw new ProfileCorruptionException(file, "Invalid committed profile head");
+        }
+        return result;
+    }
+
+    private CompoundTag recoveryHead(ProfileKey key) throws IOException {
+        for (Tag entry : readHeads(key.playerId()).getList("profiles", Tag.TAG_COMPOUND)) {
+            CompoundTag head = (CompoundTag) entry;
+            if (key.equals(decodeKey(head.getCompound("key")))) return head;
+        }
+        return null;
+    }
+
+    private void removeRecoveryHead(ProfileKey key) throws IOException {
+        CompoundTag heads = readHeads(key.playerId());
+        ListTag keep = new ListTag();
+        for (Tag entry : heads.getList("profiles", Tag.TAG_COMPOUND)) {
+            if (!key.equals(decodeKey(((CompoundTag) entry).getCompound("key")))) keep.add(entry);
+        }
+        heads.put("profiles", keep);
+        RecoveryIncidentJournal.seal(heads);
+        AtomicNbtFile.write(headsPath(key.playerId()), heads, faultInjector);
+    }
+
+    private void retainCommittedTransaction(CompoundTag transaction) throws IOException {
+        UUID owner = transaction.getUUID("player_uuid");
+        long revision = transaction.getLong("revision");
+        Path source = committedPath(owner, revision);
+        AtomicNbtFile.write(source, transaction, faultInjector);
+        verifyTransaction(source, AtomicNbtFile.readTransaction(source));
+        CompoundTag heads = readHeads(owner);
+        Map<ProfileKey, CompoundTag> entries = new LinkedHashMap<>();
+        for (Tag tag : heads.getList("profiles", Tag.TAG_COMPOUND)) {
+            CompoundTag entry = (CompoundTag) tag;
+            entries.put(decodeKey(entry.getCompound("key")), entry);
+        }
+        for (Tag tag : transaction.getList("profiles", Tag.TAG_COMPOUND)) {
+            CompoundTag write = (CompoundTag) tag;
+            ProfileKey key = decodeKey(write.getCompound("key"));
+            if (entries.containsKey(key) && entries.get(key).getLong("revision") > revision) continue;
+            CompoundTag head = new CompoundTag();
+            head.put("key", encodeKey(key));
+            head.putLong("revision", revision);
+            head.putString("document_sha256", NbtChecksums.canonicalSha256(write.getCompound("document")));
+            entries.put(key, head);
+        }
+        ListTag encoded = new ListTag(); entries.values().forEach(encoded::add);
+        heads.put("profiles", encoded);
+        RecoveryIncidentJournal.seal(heads);
+        AtomicNbtFile.write(headsPath(owner), heads, faultInjector);
+        pruneCommittedCopies(owner, entries.values());
+    }
+
+    private void pruneCommittedCopies(UUID owner, java.util.Collection<CompoundTag> heads) {
+        try {
+            java.util.Set<Long> keep = new HashSet<>();
+            heads.forEach(head -> keep.add(head.getLong("revision")));
+            List<Path> all = new ArrayList<>(playerDocuments("committed_batches", owner));
+            java.util.Collections.reverse(all);
+            for (int index = 0; index < Math.min(maxRevisions, all.size()); index++) keep.add(checkedRevision(all.get(index)));
+            for (Path file : all) {
+                if (keep.contains(checkedRevision(file))) continue;
+                // Never prune a damaged copy or one still referenced by a current profile head.
+                verifyTransaction(file, AtomicNbtFile.readTransaction(file));
+                AtomicNbtFile.deleteDurably(file);
+            }
+        } catch (IOException failure) {
+            LOGGER.warn("Committed recovery copies retained because pruning could not be verified for {}", owner, failure);
+        }
+    }
+
+    private void prepareExactRepair(UUID owner, java.util.Set<ProfileKey> damaged) throws IOException {
+        ListTag writes = new ListTag();
+        for (ProfileKey key : damaged) {
+            CompoundTag head = recoveryHead(key);
+            if (head == null) continue;
+            Path source = committedPath(owner, head.getLong("revision"));
+            if (!Files.exists(source)) continue;
+            CompoundTag transaction = readStableDocument(source, true, document -> verifyTransaction(source, document));
+            if (!transaction.hasUUID("player_uuid") || !owner.equals(transaction.getUUID("player_uuid"))
+                    || transaction.getLong("revision") != head.getLong("revision"))
+                throw new ProfileCorruptionException(source, "Committed source identity mismatch");
+            for (Tag tag : transaction.getList("profiles", Tag.TAG_COMPOUND)) {
+                CompoundTag write = (CompoundTag) tag;
+                if (!key.equals(decodeKey(write.getCompound("key")))) continue;
+                CompoundTag document = write.getCompound("document");
+                decodeProfile(source, key, document, false);
+                if (!head.getString("document_sha256").equals(NbtChecksums.canonicalSha256(document)))
+                    throw new ProfileCorruptionException(source, "Committed after-image differs from latest head");
+                CompoundTag item = write.copy();
+                item.putLong("source_revision", head.getLong("revision"));
+                item.putString("before_sha256", Files.exists(profilePath(key))
+                        ? AtomicNbtFile.snapshot(profilePath(key), false).sha256() : "missing");
+                writes.add(item);
+            }
+        }
+        if (writes.isEmpty()) return;
+        CompoundTag plan = new CompoundTag();
+        plan.putUUID("player_uuid", owner);
+        plan.putLong("generation", incidents.read(owner).getLong("generation"));
+        plan.put("profiles", writes);
+        RecoveryIncidentJournal.seal(plan);
+        AtomicNbtFile.write(repairPlanPath(owner), plan, faultInjector);
+    }
+
+    private void applyExactRepair(UUID owner) throws IOException {
+        Path file = repairPlanPath(owner);
+        CompoundTag plan = readStableDocument(file, true, document -> RecoveryIncidentJournal.verify(file, document));
+        if (!plan.hasUUID("player_uuid") || !owner.equals(plan.getUUID("player_uuid")))
+            throw new ProfileCorruptionException(file, "Exact repair owner mismatch");
+        // Validate every participant and current head before replacing the first target.
+        List<CompoundTag> remaining = new ArrayList<>();
+        boolean superseded = plan.getLong("generation") != incidents.read(owner).getLong("generation");
+        for (Tag tag : plan.getList("profiles", Tag.TAG_COMPOUND)) {
+            CompoundTag write = (CompoundTag) tag;
+            ProfileKey key = decodeKey(write.getCompound("key"));
+            if (!owner.equals(key.playerId())) throw new ProfileCorruptionException(file, "Exact repair key mismatch");
+            CompoundTag wanted = write.getCompound("document");
+            decodeProfile(file, key, wanted, false);
+            CompoundTag head = recoveryHead(key);
+            if (head == null || head.getLong("revision") != write.getLong("source_revision")
+                    || !head.getString("document_sha256").equals(NbtChecksums.canonicalSha256(wanted))) superseded = true;
+            if (Files.exists(profilePath(key))) {
+                AtomicNbtFile.Snapshot current = AtomicNbtFile.snapshot(profilePath(key), false);
+                try { if (current.parse().equals(wanted)) continue; }
+                catch (IOException expectedDamage) { /* The recorded input hash is checked below. */ }
+                if (!current.sha256().equals(write.getString("before_sha256"))) superseded = true;
+            } else if (!"missing".equals(write.getString("before_sha256"))) {
+                superseded = true;
+            }
+            remaining.add(write);
+        }
+        if (superseded) {
+            Path archived = root.resolve("diagnostics/superseded-repairs").resolve(owner.toString()).resolve(UUID.randomUUID() + ".dat");
+            Files.createDirectories(archived.getParent());
+            Files.move(file, archived, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            return;
+        }
+        for (CompoundTag write : remaining) {
+            ProfileKey key = decodeKey(write.getCompound("key"));
+            AtomicNbtFile.write(profilePath(key), write.getCompound("document"), new AtomicNbtFile.FaultInjector() {
+                @Override public void beforeWrite(Path temporary, Path destination, int bytes) throws IOException {
+                    faultInjector.beforeWrite(temporary, destination, bytes);
+                }
+                @Override public void beforeForce(Path temporary, Path destination) throws IOException {
+                    faultInjector.beforeForce(temporary, destination);
+                }
+                @Override public void beforeMove(Path temporary, Path destination) throws IOException {
+                    faultInjector.beforeMove(temporary, destination);
+                    String actual = Files.exists(destination) ? AtomicNbtFile.snapshot(destination, false).sha256() : "missing";
+                    if (!actual.equals(write.getString("before_sha256"))) throw new IOException("Exact repair input changed before atomic replacement");
+                }
+                @Override public void afterMove(Path destination) throws IOException { faultInjector.afterMove(destination); }
+            });
+        }
+        for (Tag tag : plan.getList("profiles", Tag.TAG_COMPOUND)) {
+            ProfileKey key = decodeKey(((CompoundTag) tag).getCompound("key"));
+            inspectStableProfile(key);
+            incidents.resolved(owner, profilePath(key), "Exact repair verified");
+        }
+        Path receipt = root.resolve("diagnostics/completed-repairs").resolve(owner.toString())
+                .resolve(plan.getLong("generation") + ".dat");
+        AtomicNbtFile.write(receipt, plan, faultInjector);
+        AtomicNbtFile.deleteDurably(file);
     }
 
     private void loadQuarantineMarkers() throws IOException {
+        Path repairs = root.resolve("exact_repairs");
+        if (Files.isDirectory(repairs)) try (var files = Files.list(repairs)) {
+            for (Path file : files.filter(p -> p.getFileName().toString().endsWith(".dat")).toList()) {
+                String name = file.getFileName().toString();
+                parseUuid(name.substring(0, name.length() - 4)).ifPresent(owner ->
+                        blockedPlayers.put(owner, new ProfileCorruptionException(file, "Exact recovery requires verification")));
+            }
+        }
+        Path journals = root.resolve("recovery_incidents");
+        if (Files.isDirectory(journals)) {
+            try (var paths = Files.list(journals)) {
+                for (Path file : paths.filter(p -> p.getFileName().toString().endsWith(".dat")).toList()) {
+                    String name = file.getFileName().toString();
+                    Optional<UUID> owner = parseUuid(name.substring(0, name.length() - 4));
+                    if (owner.isEmpty()) continue;
+                    UUID id = owner.orElseThrow();
+                    try {
+                        recoveryGenerations.put(id, incidents.read(id).getLong("generation"));
+                        for (Path source : incidents.unresolved(id)) markBlocked(id, source,
+                                new ProfileCorruptionException(source, "Awaiting automatic reinspection"));
+                    } catch (IOException failure) {
+                        blockedPlayers.put(id, new ProfileCorruptionException(file, "Recovery journal unavailable", failure));
+                    }
+                }
+            }
+        }
         Path directory = root.resolve("quarantine");
         if (!Files.isDirectory(directory)) {
             return;
@@ -1610,40 +2176,38 @@ public final class NbtProfileStore implements ProfileStore {
     private void blockPlayer(UUID playerId, Path file, IOException cause) {
         ProfileCorruptionException failure = new ProfileCorruptionException(file,
                 "Player persistence quarantined for " + playerId + "; original data retained", cause);
-        if (blockedPlayers.putIfAbsent(playerId, failure) != null) {
-            return;
-        }
+        markBlocked(playerId, file, failure);
         invalidatePlayer(playerId);
-        Path directory = root.resolve("quarantine").resolve(playerId.toString());
         try {
-            Files.createDirectories(directory);
-            // Never move/delete the canonical file: a failed archive must not become a missing profile.
-            if (Files.isRegularFile(file)) {
-                if (Files.size(file) > 256L * 1024L * 1024L) {
-                    throw new IOException("Corrupt file exceeds automatic archival limit; preserve original in place");
-                }
-                byte[] bytes = Files.readAllBytes(file);
-                String hash;
-                try {
-                    hash = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
-                } catch (java.security.NoSuchAlgorithmException impossible) {
-                    throw new IllegalStateException(impossible);
-                }
-                AtomicNbtFile.writeBytes(directory.resolve(hash + ".bin"), bytes, FaultInjector.NONE);
-                CompoundTag receipt = new CompoundTag();
-                receipt.putUUID("player_uuid", playerId);
-                receipt.putString("source", root.relativize(file).toString());
-                receipt.putString("sha256", hash);
-                receipt.putString("reason", cause.toString());
-                receipt.putString("result", "blocked; original retained; no empty-profile fallback");
-                AtomicNbtFile.write(directory.resolve(hash + ".dat"), receipt);
-            }
+            recordIncident(playerId, file, cause);
+            recoveryGenerations.put(playerId, incidents.read(playerId).getLong("generation"));
         } catch (IOException archivalFailure) {
             failure.addSuppressed(archivalFailure);
+            blockedPlayers.put(playerId, failure);
             LOGGER.error("Unable to archive quarantined MWI data {}; original retained", file, archivalFailure);
         }
-        LOGGER.error("MWI player {} quarantined at {}; recovery blocked, other players remain available",
+        LOGGER.warn("MWI data for {} requires automatic recovery at {}",
                 playerId, file, failure);
+    }
+
+    private void markBlocked(UUID playerId, Path file, ProfileCorruptionException failure) {
+        if (file.startsWith(root.resolve("profiles").resolve(playerId.toString()))
+                && isCanonicalProfilePath(playerId, file)) blockedProfiles.put(keyFromPath(playerId, file), failure);
+        else blockedPlayers.put(playerId, failure);
+    }
+
+    private void recordIncident(UUID owner, Path file, IOException failure) throws IOException {
+        Map<Path, IOException> inputs = pendingEvidence.computeIfAbsent(owner, ignored -> new ConcurrentHashMap<>());
+        // Keep the original failed bytes even when diagnostic storage itself is temporarily unavailable.
+        IOException original = inputs.computeIfAbsent(file, ignored -> failure);
+        incidents.failed(owner, file, original);
+        inputs.remove(file, original);
+    }
+
+    private void flushPendingEvidence(UUID owner) throws IOException {
+        Map<Path, IOException> inputs = pendingEvidence.get(owner);
+        if (inputs == null) return;
+        for (var entry : inputs.entrySet()) recordIncident(owner, entry.getKey(), entry.getValue());
     }
 
     private void archiveCorruptMetadata(Path file, String category) throws IOException {
@@ -1663,6 +2227,7 @@ public final class NbtProfileStore implements ProfileStore {
         }
         for (long revision : all.subList(maxRevisions, all.size())) {
             Files.deleteIfExists(revisionPath(playerId, revision));
+            Files.deleteIfExists(completedRevisionPath(playerId, revision));
         }
     }
 
@@ -1710,6 +2275,9 @@ public final class NbtProfileStore implements ProfileStore {
         }
 
         default void beforeProfileRead(Path file, ProfileKey key) throws IOException {
+        }
+
+        default void afterSnapshot(Path file, byte[] bytes) throws IOException {
         }
     }
 

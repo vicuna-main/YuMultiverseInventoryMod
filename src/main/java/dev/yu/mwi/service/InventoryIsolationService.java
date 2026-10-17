@@ -45,6 +45,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -82,6 +83,14 @@ public final class InventoryIsolationService implements AutoCloseable {
     private final Map<UUID, ReentrantLock> playerLocks = new ConcurrentHashMap<>();
     private final Set<UUID> activeTransactions = ConcurrentHashMap.newKeySet();
     private final Set<UUID> quarantinedPlayers = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, RecoveryHold> recoveryHolds = new ConcurrentHashMap<>();
+    private final Set<ServerPlayer> retiredRecoveryPlayers = Collections.synchronizedSet(
+            Collections.newSetFromMap(new java.util.WeakHashMap<>()));
+    private final Map<UUID, Long> backgroundRecoveryAt = new HashMap<>();
+    private final Set<UUID> backgroundRecoveryRunning = new HashSet<>();
+    private final RecoveryExecutor recoveryExecutor;
+    private final ThreadLocal<Boolean> recoveryInternal = ThreadLocal.withInitial(() -> false);
+    private boolean stopping;
     private final List<Long> dimensionCaptureLatenciesNanos = new ArrayList<>();
     private final List<Long> revisionAllocationLatenciesNanos = new ArrayList<>();
     private final LongAdder quarantineEvents = new LongAdder();
@@ -109,9 +118,12 @@ public final class InventoryIsolationService implements AutoCloseable {
         this.logger = Objects.requireNonNull(logger, "logger");
         this.store = Objects.requireNonNull(store, "store");
         this.snapshotWriter = new ProfileSnapshotWriter(store, logger, config.storage());
+        this.recoveryExecutor = new RecoveryExecutor(config.storage().ioConcurrency(), config.storage().queueCapacity(),
+                java.time.Duration.ofSeconds(config.storage().flushTimeoutSeconds()));
         this.migrationService = new ProfileMigrationService(server, snapshotWriter, logger);
         this.recoveryService = new RevisionRecoveryService(store);
         this.state = State.create(config, adapters, 1L);
+        store.recoveryCandidates().forEach(owner -> backgroundRecoveryAt.put(owner, 0L));
         this.recoveryCenter = new dev.yu.mwi.recovery.RecoveryCenter(store,
                 new dev.yu.mwi.recovery.RecoveryCenter.Host() {
                     @Override public void awaitPendingWrites(UUID owner) throws IOException {
@@ -237,6 +249,10 @@ public final class InventoryIsolationService implements AutoCloseable {
 
     public void login(ServerPlayer player) throws TransitionException {
         requireServerThread();
+        if (isRecoveryHeld(player) || !sessions.containsKey(player.getUUID())) {
+            beginRecoveryHold(player);
+            return;
+        }
         Session existing = sessions.get(player.getUUID());
         if (existing != null && existing.owner() == player) {
             if (quarantinedPlayers.contains(player.getUUID())) {
@@ -268,6 +284,7 @@ public final class InventoryIsolationService implements AutoCloseable {
         Objects.requireNonNull(player, "player");
         Objects.requireNonNull(fromDimension, "fromDimension");
         Objects.requireNonNull(toDimension, "toDimension");
+        if (isRecoveryHeld(player)) return;
         if (activeTransactions.contains(player.getUUID())) {
             return;
         }
@@ -302,6 +319,10 @@ public final class InventoryIsolationService implements AutoCloseable {
     /** Cheap hybrid-server fallback: only dimension/game-mode/config generation comparisons on the normal path. */
     public void tick(ServerPlayer player) throws TransitionException {
         requireServerThread();
+        if (isRecoveryHeld(player)) {
+            tickRecoveryHold(player);
+            return;
+        }
         try {
             snapshotWriter.throwIfFailed(player.getUUID());
         } catch (IOException failure) {
@@ -326,15 +347,45 @@ public final class InventoryIsolationService implements AutoCloseable {
         } else {
             session.location().update(player);
         }
+        if (state.config().storage().automaticRecovery()
+                && backgroundRecoveryAt.getOrDefault(player.getUUID(), Long.MAX_VALUE) <= System.nanoTime()
+                && backgroundRecoveryRunning.add(player.getUUID())) {
+            backgroundRecoveryAt.put(player.getUUID(), nextRecoveryTime());
+            snapshotWriter.inspectInQueue(player.getUUID(), true).whenComplete((inspection, failure) -> server.execute(() -> {
+                backgroundRecoveryRunning.remove(player.getUUID());
+                if (stopping || isRecoveryHeld(player) || sessions.get(player.getUUID()) != session) return;
+                if (failure != null) { logger.warn("Background recovery still waiting for {}", player.getUUID(), failure); return; }
+                if (!inspection.ready(Set.copyOf(session.profiles().values()))) {
+                    quarantine(player, new IOException("Active profile dependencies require recovery")); return;
+                }
+                snapshotWriter.mergeInspection(player.getUUID(), inspection);
+                if (inspection.unavailable().isEmpty()) backgroundRecoveryAt.remove(player.getUUID());
+            }));
+        }
     }
 
     public void respawned(ServerPlayer player) throws TransitionException {
         requireServerThread();
+        if (isRecoveryHeld(player)) return;
         withPlayerLock(player, () -> reseedCurrent(player, "respawn"));
     }
 
     public void logout(ServerPlayer player) throws TransitionException {
         requireServerThread();
+        RecoveryHold newer = recoveryHolds.get(player.getUUID());
+        if (newer != null && newer.owner != player) return;
+        if (isRecoveryHeld(player)) {
+            RecoveryHold hold = recoveryHolds.get(player.getUUID());
+            if (hold == null) return;
+            hold.disconnected = true;
+            retiredRecoveryPlayers.add(player);
+            recoveryHolds.remove(player.getUUID(), hold);
+            backgroundRecoveryAt.put(player.getUUID(), nextRecoveryTime());
+            sessions.remove(player.getUUID());
+            recoverySessionTokens.remove(player.getUUID());
+            adapters.adapters().forEach(adapter -> adapter.sessionClosed(player));
+            return;
+        }
         Session session = sessions.get(player.getUUID());
         if (session != null && session.owner() != player) {
             return;
@@ -404,6 +455,7 @@ public final class InventoryIsolationService implements AutoCloseable {
 
     private void checkpoint(ServerPlayer player, String reason, boolean asynchronous) throws TransitionException {
         requireServerThread();
+        if (isRecoveryHeld(player)) return;
         if (recoveryCheckpoints.contains(player.getUUID())) return;
         Session session = sessions.get(player.getUUID());
         if (session == null || session.owner() != player) {
@@ -1285,6 +1337,10 @@ public final class InventoryIsolationService implements AutoCloseable {
         recordQuarantine(player.getUUID());
         store.markUncleanShutdown();
         logger.error("Inventory transaction failed for {} ({})", player.getGameProfile().getName(), player.getUUID(), failure);
+        if (recoverablePersistenceFailure(failure)) {
+            beginRecoveryHold(player);
+            return;
+        }
         player.connection.disconnect(Component.literal(
                 "Yu Multiverse Inventory could not safely switch your profile. Canonical profile writes are now "
                         + "blocked; contact an administrator before reconnecting."));
@@ -1299,9 +1355,11 @@ public final class InventoryIsolationService implements AutoCloseable {
     @Override
     public void close() throws IOException {
         requireServerThread();
+        stopping = true;
         boolean clean = true;
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             try {
+                if (isRecoveryHeld(player)) continue;
                 if (quarantinedPlayers.contains(player.getUUID())) {
                     persistQuarantined(player, "server stop while player was quarantined");
                 } else {
@@ -1328,6 +1386,8 @@ public final class InventoryIsolationService implements AutoCloseable {
             store.markUncleanShutdown();
         }
         IOException closeFailure = null;
+        try { recoveryExecutor.close(); }
+        catch (IOException failure) { closeFailure = failure; store.markUncleanShutdown(); }
         try {
             snapshotWriter.close();
         } catch (IOException failure) {
@@ -2224,6 +2284,222 @@ public final class InventoryIsolationService implements AutoCloseable {
         ProfileSnapshotWriter.collectWorldBackups(
                 player, world, activeKeys, activeAdapters, overrides, writes,
                 state.config().model().shareHandling().alwaysWriteWorldProfile());
+        writes.keySet().removeIf(snapshotWriter::unavailable);
+    }
+
+    public void prepareLogin(ServerPlayer player) {
+        requireServerThread();
+        RecoveryHold existing = recoveryHolds.get(player.getUUID());
+        if (existing != null && existing.owner == player) return;
+        recoveryHolds.put(player.getUUID(), new RecoveryHold(player, snapshotWriter.fence(player.getUUID())));
+    }
+
+    public boolean isRecoveryHeld(ServerPlayer player) {
+        RecoveryHold hold = recoveryHolds.get(player.getUUID());
+        return (hold != null && hold.owner == player) || retiredRecoveryPlayers.contains(player);
+    }
+
+    public boolean isRecoveryInternal() { return recoveryInternal.get(); }
+
+    public void captureLoadedPlayer(ServerPlayer player, CompoundTag loaded) {
+        RecoveryHold hold = recoveryHolds.get(player.getUUID());
+        if (hold != null && hold.owner == player) hold.loadedPlayer = loaded.copy();
+    }
+
+    public boolean isRecoveryDisplay(ServerPlayer player) {
+        RecoveryHold hold = recoveryHolds.get(player.getUUID());
+        return hold != null && hold.owner == player && hold.captured != null;
+    }
+
+    private void beginRecoveryHold(ServerPlayer player) {
+        requireServerThread();
+        prepareLogin(player);
+        RecoveryHold hold = recoveryHolds.get(player.getUUID());
+        if (hold.captured == null) {
+            recoveryInternal.set(true);
+            try {
+                closeMenu(player);
+                hold.mode = player.gameMode.getGameModeForPlayer();
+                hold.captured = capture(player, activeAdapters(player, state).values());
+                hold.detached = new CompoundTag();
+                hold.captured.forEach((adapter, tag) -> hold.detached.put(adapter.id().toString(), tag.copy()));
+                if (hold.loadedPlayer != null) hold.detached.put("vanilla_login_input", hold.loadedPlayer);
+                hold.required = Set.copyOf(profileKeys(player, WorldIdentities.from(player.serverLevel()), state,
+                        activeAdapters(player, state)).values());
+                sessions.remove(player.getUUID());
+            } finally { recoveryInternal.remove(); }
+            player.sendSystemMessage(Component.literal("背包正在核验或恢复，请稍候；暂时无法操作物品。"));
+        }
+        requestAutomaticRecovery(hold);
+    }
+
+    private void requestAutomaticRecovery(RecoveryHold hold) {
+        if (stopping || hold.running || hold.captured == null) return;
+        hold.running = true;
+        UUID owner = hold.owner.getUUID(), incident = hold.incident;
+        long fence = hold.fence;
+        CompoundTag detached = hold.detached.copy();
+        boolean repair = state.config().storage().automaticRecovery() || hold.manualRetry;
+        hold.manualRetry = false;
+        recoveryExecutor.submit(owner, incident, () -> snapshotWriter.recover(owner, fence, incident, detached, repair))
+                .whenComplete((inspection, failure) -> server.execute(() -> {
+                    hold.running = false;
+                    if (stopping || recoveryHolds.get(owner) != hold || hold.disconnected) return;
+                    if (server.getPlayerList().getPlayer(owner) != hold.owner) { hold.disconnected = true; return; }
+                    hold.retryAt = nextRecoveryTime();
+                    if (failure != null) {
+                        logger.warn("Automatic inventory recovery remains pending for {}", owner, failure);
+                        return;
+                    }
+                    hold.inspection = inspection;
+                    if (!inspection.ready(hold.required)) {
+                        displayRecoveryHold(hold);
+                        return;
+                    }
+                    activateRecovered(hold, inspection);
+                }));
+    }
+
+    public void tickOfflineRecovery() {
+        requireServerThread();
+        if (stopping || !state.config().storage().automaticRecovery()) return;
+        int submitted = 0;
+        for (UUID owner : List.copyOf(backgroundRecoveryAt.keySet())) {
+            RecoveryHold hold = recoveryHolds.get(owner);
+            if (sessions.containsKey(owner) || (hold != null && !hold.disconnected)
+                    || backgroundRecoveryRunning.contains(owner) || backgroundRecoveryAt.get(owner) > System.nanoTime()) continue;
+            if (++submitted > 4) break;
+            backgroundRecoveryRunning.add(owner);
+            backgroundRecoveryAt.put(owner, nextRecoveryTime());
+            long fence = snapshotWriter.fence(owner);
+            recoveryExecutor.submit(owner, "offline", () -> snapshotWriter.recover(owner, fence, null, null, true))
+                    .whenComplete((inspection, failure) -> server.execute(() -> {
+                        backgroundRecoveryRunning.remove(owner);
+                        RecoveryHold current = recoveryHolds.get(owner);
+                        if (stopping || (current != null && !current.disconnected)) return;
+                        if (failure != null) { logger.warn("Offline recovery remains pending for {}", owner, failure); return; }
+                        try {
+                            if (inspection.pending().isEmpty()) {
+                                snapshotWriter.installRecovered(owner, fence, inspection);
+                                snapshotWriter.forget(owner);
+                            }
+                            if ("RESOLVED".equals(inspection.state())) backgroundRecoveryAt.remove(owner);
+                        } catch (IOException changed) { logger.warn("Offline recovery generation changed for {}", owner, changed); }
+                    }));
+        }
+    }
+
+    private void displayRecoveryHold(RecoveryHold hold) {
+        if (hold.displayed) return;
+        recoveryInternal.set(true);
+        try {
+            // The original adapter snapshot is durable before this method is called.
+            List<SharableAdapter> items = hold.captured.keySet().stream()
+                    .filter(adapter -> ItemProfileCompatibility.supports(adapter.id().getPath())).toList();
+            replace(hold.owner, items, () -> items.forEach(adapter -> adapter.clear(hold.owner)));
+            hold.owner.setGameMode(net.minecraft.world.level.GameType.SPECTATOR);
+            hold.displayed = true;
+            hold.owner.sendSystemMessage(Component.literal("背包正在恢复，暂时无法取回；恢复成功后会自动继续。"));
+        } finally { recoveryInternal.remove(); }
+    }
+
+    private void activateRecovered(RecoveryHold hold, dev.yu.mwi.storage.RecoveryInspection inspection) {
+        recoveryInternal.set(true);
+        try {
+            if (inspection.generation() != store.recoveryGeneration(hold.owner.getUUID())) return;
+            hold.owner.setGameMode(hold.mode);
+            rollback(hold.owner, hold.captured);
+            snapshotWriter.installRecovered(hold.owner.getUUID(), hold.fence, inspection);
+            quarantinedPlayers.remove(hold.owner.getUUID());
+            withPlayerLock(hold.owner, () -> initialize(hold.owner));
+            Session session = sessions.get(hold.owner.getUUID());
+            // Activation remains fenced until every persisted adapter has been applied and synced.
+            for (var entry : session.activeAdapters().entrySet()) {
+                var stored = snapshotWriter.load(session.profiles().get(entry.getKey()));
+                if (stored.isPresent() && !entry.getValue().equivalent(stored.orElseThrow().payload(),
+                        entry.getValue().capture(hold.owner, hold.owner.registryAccess())))
+                    throw new IOException("Adapter verification failed during recovery activation: " + entry.getKey());
+            }
+            recoveryHolds.remove(hold.owner.getUUID(), hold);
+            if (!inspection.unavailable().isEmpty()) backgroundRecoveryAt.put(hold.owner.getUUID(),
+                    nextRecoveryTime());
+            if (hold.displayed) hold.owner.sendSystemMessage(Component.literal("背包已恢复，可以继续游戏。"));
+        } catch (IOException | TransitionException | RuntimeException failure) {
+            sessions.remove(hold.owner.getUUID());
+            recordQuarantine(hold.owner.getUUID());
+            hold.fence = snapshotWriter.fence(hold.owner.getUUID());
+            hold.displayed = false;
+            logger.error("Recovery activation remains fenced for {}", hold.owner.getUUID(), failure);
+            displayRecoveryHold(hold);
+        } finally { recoveryInternal.remove(); }
+    }
+
+    private void tickRecoveryHold(ServerPlayer player) {
+        RecoveryHold hold = recoveryHolds.get(player.getUUID());
+        if (hold.captured == null || hold.disconnected) return;
+        closeMenu(player);
+        player.setDeltaMovement(net.minecraft.world.phys.Vec3.ZERO);
+        player.fallDistance = 0;
+        if (!hold.running && System.nanoTime() >= hold.retryAt && state.config().storage().automaticRecovery()) requestAutomaticRecovery(hold);
+    }
+
+    public java.util.concurrent.CompletableFuture<dev.yu.mwi.storage.RecoveryInspection> inspectAutomaticRecovery(
+            UUID owner, boolean repair) {
+        requireServerThread();
+        RecoveryHold hold = recoveryHolds.get(owner);
+        if (hold != null && !hold.disconnected && repair) {
+            hold.retryAt = 0;
+            hold.manualRetry = true;
+            requestAutomaticRecovery(hold);
+            return java.util.concurrent.CompletableFuture.completedFuture(hold.inspection);
+        }
+        if (sessions.containsKey(owner)) return snapshotWriter.inspectInQueue(owner, repair);
+        if (!repair) return recoveryExecutor.submit(owner, "inspect-only", () -> store.inspectRecovery(owner, false));
+        long fence = snapshotWriter.fence(owner);
+        backgroundRecoveryAt.put(owner, nextRecoveryTime());
+        var result = recoveryExecutor.submit(owner, "manual-retry",
+                () -> snapshotWriter.recover(owner, fence, null, null, true));
+        result.thenAccept(inspection -> server.execute(() -> {
+            if (stopping || recoveryHolds.containsKey(owner) || sessions.containsKey(owner)) return;
+            try {
+                if (inspection.pending().isEmpty()) {
+                    snapshotWriter.installRecovered(owner, fence, inspection);
+                    snapshotWriter.forget(owner);
+                }
+                if ("RESOLVED".equals(inspection.state())) backgroundRecoveryAt.remove(owner);
+            } catch (IOException changed) { logger.warn("Manual recovery remains pending for {}", owner, changed); }
+        }));
+        return result;
+    }
+
+    private static boolean recoverablePersistenceFailure(Throwable failure) {
+        boolean dataFailure = false;
+        Throwable root = failure;
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof Error) return false;
+            if (cause instanceof dev.yu.mwi.storage.ProfileCorruptionException) dataFailure = true;
+            root = cause;
+        }
+        return dataFailure || root instanceof IOException || root instanceof java.util.concurrent.RejectedExecutionException;
+    }
+
+    private long nextRecoveryTime() {
+        return System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(state.config().storage().recoveryRetrySeconds());
+    }
+
+    private static final class RecoveryHold {
+        final ServerPlayer owner;
+        final UUID incident = UUID.randomUUID();
+        long fence;
+        Map<SharableAdapter, CompoundTag> captured;
+        CompoundTag detached;
+        CompoundTag loadedPlayer;
+        Set<ProfileKey> required;
+        net.minecraft.world.level.GameType mode;
+        dev.yu.mwi.storage.RecoveryInspection inspection;
+        boolean running, displayed, disconnected, manualRetry;
+        long retryAt;
+        RecoveryHold(ServerPlayer owner, long fence) { this.owner = owner; this.fence = fence; }
     }
 
     private Map<String, ProfileKey> profileKeys(
