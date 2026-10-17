@@ -9,6 +9,7 @@ import dev.yu.mwi.storage.ProfileStore;
 import dev.yu.mwi.storage.ProfileArchive;
 import dev.yu.mwi.storage.StoredProfile;
 import dev.yu.mwi.storage.WorldProfile;
+import dev.yu.mwi.storage.RecoveryInspection;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
@@ -28,6 +29,7 @@ final class ProfileSnapshotWriter implements AutoCloseable {
     private final Logger logger;
     private final ProfilePersistenceQueue queue;
     private final Map<UUID, Map<ProfileKey, StoredProfile>> workingSets = new ConcurrentHashMap<>();
+    private final Map<UUID, Map<ProfileKey, String>> unavailable = new ConcurrentHashMap<>();
 
     ProfileSnapshotWriter(ProfileStore store, Logger logger, RuntimeConfig.Storage storage) {
         this.store = store;
@@ -45,6 +47,9 @@ final class ProfileSnapshotWriter implements AutoCloseable {
     }
 
     Optional<StoredProfile> load(ProfileKey key) {
+        if (unavailable.getOrDefault(key.playerId(), Map.of()).containsKey(key))
+            throw new IllegalStateException("Profile is waiting for recovery: " + key,
+                    new IOException(unavailable.get(key.playerId()).get(key)));
         Map<ProfileKey, StoredProfile> profiles = workingSets.get(key.playerId());
         if (profiles == null) {
             throw new IllegalStateException("Player working set was not preloaded: " + key.playerId());
@@ -63,7 +68,8 @@ final class ProfileSnapshotWriter implements AutoCloseable {
         if (profiles == null) {
             throw new IllegalStateException("Player working set was not preloaded: " + playerId);
         }
-        return profiles.keySet().stream().anyMatch(key -> key.shareId().equals(shareId));
+        return profiles.keySet().stream().anyMatch(key -> key.shareId().equals(shareId))
+                || unavailable.getOrDefault(playerId, Map.of()).keySet().stream().anyMatch(key -> key.shareId().equals(shareId));
     }
 
     java.util.List<WorldProfile> listWorldProfiles(UUID playerId, dev.yu.mwi.domain.GameModeBucket gameMode,
@@ -94,6 +100,7 @@ final class ProfileSnapshotWriter implements AutoCloseable {
             writes.put(keys.get(entry.getKey()), payload);
         }
         collectWorldBackups(player, world, keys, adapters, captured, writes, writeWorldBackups);
+        writes.keySet().removeIf(this::unavailable);
         if (asynchronous) {
             enqueue(player.getUUID(), revision, writes, Optional.empty(), reason);
         } else {
@@ -224,6 +231,7 @@ final class ProfileSnapshotWriter implements AutoCloseable {
 
     void forget(UUID playerId) {
         workingSets.remove(playerId);
+        unavailable.remove(playerId);
     }
 
     void preserveQuarantined(
@@ -264,6 +272,51 @@ final class ProfileSnapshotWriter implements AutoCloseable {
 
     void flushAll() throws IOException {
         queue.flushAll();
+    }
+
+    long fence(UUID playerId) { return queue.fence(playerId); }
+
+    RecoveryInspection recover(UUID playerId, long token, UUID sessionId, CompoundTag live, boolean repair) throws IOException {
+        queue.drainForRecovery(playerId, token);
+        if (live != null) store.preserveRecoverySession(playerId, sessionId, live);
+        RecoveryInspection result = store.inspectRecovery(playerId, repair);
+        if (!result.pending().isEmpty()) return result;
+        if (!repair && !result.unavailable().isEmpty()) return result;
+        return queue.retryFailedWrites(playerId, token) ? store.inspectRecovery(playerId, repair) : result;
+    }
+
+    void installRecovered(UUID playerId, long token, RecoveryInspection result) throws IOException {
+        if (result.generation() != store.recoveryGeneration(playerId)) throw new IOException("Recovery generation changed");
+        queue.releaseRecovery(playerId, token);
+        installInspection(playerId, result);
+    }
+
+    void installInspection(UUID playerId, RecoveryInspection result) {
+        workingSets.put(playerId, new ConcurrentHashMap<>(result.profiles()));
+        unavailable.put(playerId, result.unavailable());
+    }
+
+    void mergeInspection(UUID playerId, RecoveryInspection result) {
+        Map<ProfileKey, StoredProfile> working = workingSets.get(playerId);
+        if (working == null) return;
+        result.profiles().forEach((key, profile) -> working.compute(key,
+                (ignored, existing) -> existing == null || existing.revision() <= profile.revision() ? profile : existing));
+        unavailable.put(playerId, result.unavailable());
+    }
+
+    boolean unavailable(ProfileKey key) { return unavailable.getOrDefault(key.playerId(), Map.of()).containsKey(key); }
+
+    java.util.concurrent.CompletableFuture<RecoveryInspection> inspectInQueue(UUID playerId, boolean repair) {
+        var result = new java.util.concurrent.CompletableFuture<RecoveryInspection>();
+        try {
+            queue.submit(playerId, () -> {
+                try { result.complete(store.inspectRecovery(playerId, repair)); }
+                catch (IOException failure) { result.completeExceptionally(failure); }
+            }).whenComplete((ignored, failure) -> {
+                if (failure != null) result.completeExceptionally(failure);
+            });
+        } catch (java.util.concurrent.RejectedExecutionException failure) { result.completeExceptionally(failure); }
+        return result;
     }
 
     ProfilePersistenceQueue.Metrics metrics() {

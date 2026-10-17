@@ -17,5 +17,6 @@ public final class YuMultiverseInventory {
     public YuMultiverseInventory(IEventBus modEventBus) {
         MwiServerController controller = new MwiServerController(LOGGER);
         NeoForge.EVENT_BUS.register(new NeoForgeEventHandler(controller, LOGGER));
+        NeoForge.EVENT_BUS.register(new dev.yu.mwi.platform.RecoveryProtectionEvents());
     }
 }

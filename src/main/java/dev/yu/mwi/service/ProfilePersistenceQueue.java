@@ -32,6 +32,9 @@ final class ProfilePersistenceQueue implements AutoCloseable {
     private final Map<UUID, CoalescingIoAction> pendingCoalescing = new LinkedHashMap<>();
     private final Map<UUID, IOException> failures = new LinkedHashMap<>();
     private final Set<UUID> unhealthyPlayers = new HashSet<>();
+    private final Map<UUID, Long> recoveryFences = new LinkedHashMap<>();
+    private final Map<UUID, List<IoAction>> uncommittedActions = new LinkedHashMap<>();
+    private long nextFence;
     private final List<Long> completedLatenciesNanos = new ArrayList<>();
     private final List<Long> completedExecutionLatenciesNanos = new ArrayList<>();
     private final List<Long> activeEnqueuedNanos = new ArrayList<>();
@@ -67,12 +70,15 @@ final class ProfilePersistenceQueue implements AutoCloseable {
         });
     }
 
-    synchronized void submit(UUID playerId, IoAction action) {
+    synchronized CompletableFuture<Void> submit(UUID playerId, IoAction action) {
         java.util.Objects.requireNonNull(playerId, "playerId");
         java.util.Objects.requireNonNull(action, "action");
         if (!accepting) {
             rejectedSubmissions++;
             throw new RejectedExecutionException("Profile persistence queue is stopping");
+        }
+        if (recoveryFences.containsKey(playerId)) {
+            throw new RejectedExecutionException("Player persistence is fenced for recovery");
         }
         IOException priorFailure = failures.get(playerId);
         if (unhealthyPlayers.contains(playerId)) {
@@ -84,7 +90,7 @@ final class ProfilePersistenceQueue implements AutoCloseable {
             if (pending != null && pending.merge(newer)) {
                 queuedSubmissions++;
                 coalescedTasks++;
-                return;
+                return tails.getOrDefault(playerId, CompletableFuture.completedFuture(null));
             }
         }
         if (queuedTasks >= capacity) {
@@ -93,6 +99,7 @@ final class ProfilePersistenceQueue implements AutoCloseable {
                     "Profile persistence queue is full (capacity=" + capacity + ")");
         }
         queuedSubmissions++;
+        uncommittedActions.computeIfAbsent(playerId, ignored -> new ArrayList<>()).add(action);
 
         long enqueuedNanos = System.nanoTime();
         if (queuedTasks == 0) {
@@ -124,11 +131,12 @@ final class ProfilePersistenceQueue implements AutoCloseable {
             }
         }, executor);
         tails.put(playerId, next);
-        next.whenComplete((ignored, failure) -> taskCompleted(playerId, next, enqueuedNanos, failure));
+        next.whenComplete((ignored, failure) -> taskCompleted(playerId, next, action, enqueuedNanos, failure));
+        return next;
     }
 
     private synchronized void taskCompleted(
-            UUID playerId, CompletableFuture<Void> task, long enqueuedNanos, Throwable failure) {
+            UUID playerId, CompletableFuture<Void> task, IoAction action, long enqueuedNanos, Throwable failure) {
         queuedTasks--;
         activeEnqueuedNanos.remove(Long.valueOf(enqueuedNanos));
         if (failure != null) {
@@ -136,12 +144,74 @@ final class ProfilePersistenceQueue implements AutoCloseable {
                 failedTasks++;
                 failures.put(playerId, asIOException(unwrap(failure)));
             }
+        } else {
+            List<IoAction> actions = uncommittedActions.get(playerId);
+            if (actions != null) {
+                actions.remove(action);
+                if (actions.isEmpty()) uncommittedActions.remove(playerId);
+            }
         }
         completedLatenciesNanos.add(System.nanoTime() - enqueuedNanos);
         trimSamples(completedLatenciesNanos);
         tails.remove(playerId, task);
         oldestEnqueuedNanos = activeEnqueuedNanos.stream().mapToLong(Long::longValue).min().orElse(0L);
         notifyAll();
+    }
+
+    synchronized long fence(UUID playerId) {
+        return recoveryFences.computeIfAbsent(playerId, ignored -> nextFence = Math.incrementExact(nextFence));
+    }
+
+    /** Called on the recovery executor, without a store lock. Failed actions remain available. */
+    void drainForRecovery(UUID playerId, long token) throws IOException {
+        CompletableFuture<Void> tail;
+        synchronized (this) {
+            requireFence(playerId, token);
+            tail = tails.get(playerId);
+        }
+        if (tail != null) await(tail.handle((ignored, failure) -> null), flushTimeout, "recovery " + playerId);
+        long deadline = System.nanoTime() + flushTimeout.toNanos();
+        synchronized (this) {
+            while (tails.containsKey(playerId)) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) throw new IOException("Timed out draining recovery completion callbacks");
+                try { TimeUnit.NANOSECONDS.timedWait(this, remaining); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt(); throw new IOException(interrupted);
+                }
+            }
+            requireFence(playerId, token);
+        }
+    }
+
+    boolean retryFailedWrites(UUID playerId, long token) throws IOException {
+        List<IoAction> actions;
+        synchronized (this) {
+            requireFence(playerId, token);
+            if (tails.containsKey(playerId)) throw new IOException("Old profile writes are still running");
+            actions = List.copyOf(uncommittedActions.getOrDefault(playerId, List.of()));
+        }
+        for (IoAction action : actions) {
+            action.run(); // Replays the detached batch through the normal idempotent commit protocol.
+            synchronized (this) { uncommittedActions.get(playerId).remove(action); }
+        }
+        return !actions.isEmpty();
+    }
+
+    synchronized void releaseRecovery(UUID playerId, long token) throws IOException {
+        requireFence(playerId, token);
+        if (tails.containsKey(playerId) || !uncommittedActions.getOrDefault(playerId, List.of()).isEmpty())
+            throw new IOException("Unresolved profile writes remain");
+        uncommittedActions.remove(playerId);
+        pendingCoalescing.remove(playerId);
+        failures.remove(playerId);
+        unhealthyPlayers.remove(playerId);
+        recoveryFences.remove(playerId);
+    }
+
+    private void requireFence(UUID playerId, long token) throws IOException {
+        if (!java.util.Objects.equals(recoveryFences.get(playerId), token))
+            throw new IOException("Recovery queue generation changed");
     }
 
     void throwIfFailed(UUID playerId) throws IOException {

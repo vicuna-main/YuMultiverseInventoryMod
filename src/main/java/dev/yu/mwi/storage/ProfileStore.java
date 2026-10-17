@@ -12,6 +12,19 @@ import java.util.UUID;
 
 /** Durable, per-share profile storage. Implementations must return defensive NBT copies. */
 public interface ProfileStore extends AutoCloseable {
+    /** Runs on the bounded recovery executor, never against a live player entity. */
+    default RecoveryInspection inspectRecovery(UUID playerId, boolean repair) throws IOException {
+        return new RecoveryInspection(0, loadPlayerProfiles(playerId), Map.of(), List.of(), 0, "RESOLVED");
+    }
+
+    default long recoveryGeneration(UUID playerId) { return 0; }
+
+    default java.util.Set<UUID> recoveryCandidates() { return java.util.Set.of(); }
+
+    default void preserveRecoverySession(UUID playerId, UUID sessionId, CompoundTag adapters) throws IOException {
+        throw new IOException("This profile store does not support durable recovery sessions");
+    }
+
     /** Must atomically commit profiles, remaining escrow and the permanent source/operation receipt. */
     default void commitRecovery(UUID playerId, long revision, Map<ProfileKey, CompoundTag> profiles,
                                 RecoveryMutation mutation) throws IOException {

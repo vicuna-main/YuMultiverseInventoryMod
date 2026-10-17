@@ -29,6 +29,7 @@ NeoForge 1.21.1 服务端多世界玩家数据隔离模组。它模仿 Multivers
 - NeoForge 维度事件为主，轻量玩家 tick 仅比较维度/游戏模式作为混合端漏事件兜底。
 - 混合端在安全的 NeoForge 登录边界初始化；退出在 Bukkit Quit 后做最终保存。
 - 1.2.0 提供服务端[背包恢复中心](docs/recovery-center.md)：与 TombStoneDefender 1.5.0 通过 V2 先封存墓碑再提交物品；无关墓碑不遮住独立来源，领取条件单独展示，提醒有持久回执。
+- 1.3.0 增加[自动修复与登录自愈](docs/automatic-recovery.md)：自动复核残留隔离、从最新已提交副本精确恢复损坏档案；缺少可靠来源时保持受保护的在线恢复会话。
 
 ## 安装
 
@@ -121,6 +122,8 @@ cache_megabytes = 128
 io_concurrency = 2
 queue_capacity = 256
 flush_timeout_seconds = 30
+automatic_recovery = true
+recovery_retry_seconds = 30
 
 [mvinv_compat]
 mode = "import_and_replace"

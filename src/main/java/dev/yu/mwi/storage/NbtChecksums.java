@@ -72,7 +72,11 @@ public final class NbtChecksums {
      * and reserializing its compound maps changes their iteration order.
      */
     static String legacySha256OfStoredPayload(Path profileFile) throws IOException {
-        byte[] uncompressed = readGzipLimited(profileFile);
+        return legacySha256OfStoredPayload(AtomicNbtFile.snapshot(profileFile, false).bytes());
+    }
+
+    static String legacySha256OfStoredPayload(byte[] compressed) throws IOException {
+        byte[] uncompressed = readGzipLimited(compressed);
         ByteArrayInputStream source = new ByteArrayInputStream(uncompressed);
         try (DataInputStream input = new DataInputStream(source)) {
             int rootType = input.readUnsignedByte();
@@ -166,8 +170,8 @@ public final class NbtChecksums {
         output.write(encoded);
     }
 
-    private static byte[] readGzipLimited(Path file) throws IOException {
-        try (InputStream raw = Files.newInputStream(file);
+    private static byte[] readGzipLimited(byte[] bytes) throws IOException {
+        try (InputStream raw = new ByteArrayInputStream(bytes);
              GZIPInputStream gzip = new GZIPInputStream(raw);
              ByteArrayOutputStream output = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[8192];

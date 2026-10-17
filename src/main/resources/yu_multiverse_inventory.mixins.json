@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.yu.mwi.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": ["RecoveryPlayerListMixin", "RecoveryPlayerDataMixin", "RecoveryPacketsMixin", "RecoveryCapabilityMixin", "RecoveryPlayerActionsMixin", "RecoveryGameModeMixin"],
+  "injectors": { "defaultRequire": 1 }
+}
