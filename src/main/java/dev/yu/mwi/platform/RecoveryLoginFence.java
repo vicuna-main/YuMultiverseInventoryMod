@@ -32,6 +32,14 @@ public final class RecoveryLoginFence {
         InventoryIsolationService service = service(player);
         return service != null && service.isRecoveryHeld(player) && !service.isRecoveryInternal();
     }
+    public static boolean saveBlocked(ServerPlayer player) {
+        InventoryIsolationService service = service(player);
+        return service != null && service.isRecoveryHeld(player) && !service.isRecoveryCheckpoint(player);
+    }
+    public static boolean movementBlocked(ServerPlayer player) {
+        InventoryIsolationService service = service(player);
+        return service != null && service.isRecoveryHeld(player) && !service.isRecoveryDisplay(player);
+    }
     public static boolean teleportBlocked(ServerPlayer player) {
         InventoryIsolationService service = service(player);
         return service != null && service.isRecoveryDisplay(player) && !service.isRecoveryInternal();
@@ -40,7 +48,8 @@ public final class RecoveryLoginFence {
     public static boolean commandAllowed(String input) {
         String normalized = input.strip().toLowerCase(java.util.Locale.ROOT);
         String command = normalized.split("\\s+", 2)[0];
-        return java.util.Set.of("login", "l", "register", "reg", "authme:login", "authme:register").contains(command)
-                || normalized.matches("mwi recovery (inspect|retry) [0-9a-f-]+( --dry-run)?");
+        return java.util.Set.of("login", "l", "register", "reg", "authme:login", "authme:register", "help", "?", "mwistatus").contains(command)
+                || normalized.matches("mwi recovery (inspect|retry) [0-9a-f-]+( --dry-run)?")
+                || normalized.matches("mwi restore [a-z0-9_]+ (latest|list|status|[0-9]{8}(-[0-9]{6}(\\.[0-9]{3})?)?)");
     }
 }

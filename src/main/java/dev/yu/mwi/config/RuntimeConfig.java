@@ -37,7 +37,13 @@ public record RuntimeConfig(
             int queueCapacity,
             int flushTimeoutSeconds,
             boolean automaticRecovery,
-            int recoveryRetrySeconds) {
+            int recoveryRetrySeconds,
+            String restoreTimeZone) {
+        public Storage(int maxRevisions, int cacheEntries, int cacheMegabytes, int ioConcurrency,
+                int queueCapacity, int flushTimeoutSeconds, boolean automaticRecovery, int recoveryRetrySeconds) {
+            this(maxRevisions, cacheEntries, cacheMegabytes, ioConcurrency, queueCapacity, flushTimeoutSeconds,
+                    automaticRecovery, recoveryRetrySeconds, "Asia/Shanghai");
+        }
         public Storage(int maxRevisions, int cacheEntries, int cacheMegabytes, int ioConcurrency,
                 int queueCapacity, int flushTimeoutSeconds) {
             this(maxRevisions, cacheEntries, cacheMegabytes, ioConcurrency, queueCapacity, flushTimeoutSeconds, true, 30);
@@ -47,6 +53,7 @@ public record RuntimeConfig(
         }
 
         public Storage {
+            java.time.ZoneId.of(Objects.requireNonNull(restoreTimeZone));
             if (maxRevisions < 1 || maxRevisions > 1_000) {
                 throw new IllegalArgumentException("storage.max_revisions must be between 1 and 1000");
             }

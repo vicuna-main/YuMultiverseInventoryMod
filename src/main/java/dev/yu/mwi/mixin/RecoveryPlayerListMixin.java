@@ -25,6 +25,6 @@ abstract class RecoveryPlayerListMixin {
 
     @Inject(method = "save", at = @At("HEAD"), cancellable = true)
     private void mwi$excludeRecoveryDisplay(ServerPlayer player, CallbackInfo ci) {
-        if (RecoveryLoginFence.held(player)) ci.cancel();
+        if (RecoveryLoginFence.saveBlocked(player)) ci.cancel();
     }
 }

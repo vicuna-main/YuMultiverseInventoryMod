@@ -12,6 +12,17 @@ import java.util.UUID;
 
 /** Durable, per-share profile storage. Implementations must return defensive NBT copies. */
 public interface ProfileStore extends AutoCloseable {
+    default List<RestorePoint> restorePoints(UUID owner) throws IOException { return List.of(); }
+    default CompoundTag restoreContext(UUID owner) throws IOException { return new CompoundTag(); }
+    default CompoundTag restoreRequest(UUID owner) throws IOException { return new CompoundTag(); }
+    default Optional<CompoundTag> restoreOperation(UUID owner, UUID operation) throws IOException { return Optional.empty(); }
+    default void saveRestoreRequest(UUID owner, CompoundTag request) throws IOException {
+        throw new IOException("This profile store does not support durable restore requests");
+    }
+    default CompoundTag activationTask(UUID owner) throws IOException { return new CompoundTag(); }
+    default void saveActivationTask(UUID owner, CompoundTag task) throws IOException {
+        throw new IOException("This profile store does not support durable activation tasks");
+    }
     /** Runs on the bounded recovery executor, never against a live player entity. */
     default RecoveryInspection inspectRecovery(UUID playerId, boolean repair) throws IOException {
         return new RecoveryInspection(0, loadPlayerProfiles(playerId), Map.of(), List.of(), 0, "RESOLVED");
@@ -29,6 +40,10 @@ public interface ProfileStore extends AutoCloseable {
     default void commitRecovery(UUID playerId, long revision, Map<ProfileKey, CompoundTag> profiles,
                                 RecoveryMutation mutation) throws IOException {
         throw new IOException("This profile store does not support atomic recovery");
+    }
+    default void commitRecovery(UUID owner, long revision, Map<ProfileKey, CompoundTag> profiles,
+            RecoveryMutation mutation, CompoundTag journal, List<ProfileArchive> archives) throws IOException {
+        throw new IOException("This profile store does not support coordinated activation escrow");
     }
 
     default Optional<StoredRecovery> loadRecovery(UUID playerId, UUID sourceId) throws IOException {

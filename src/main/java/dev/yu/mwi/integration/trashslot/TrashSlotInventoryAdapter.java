@@ -48,6 +48,12 @@ public final class TrashSlotInventoryAdapter implements SharableAdapter {
     }
 
     @Override
+    public dev.yu.mwi.api.RestoreVerification verifyRestored(ServerPlayer player, CompoundTag expected,
+            CompoundTag actual, HolderLookup.Provider lookup) {
+        return dev.yu.mwi.adapter.vanilla.ItemPayloadVerification.trash(expected, actual, lookup);
+    }
+
+    @Override
     public CompoundTag capture(ServerPlayer player, HolderLookup.Provider lookup) {
         ItemStack stack = get(player).copy();
         CompoundTag result = new CompoundTag();
@@ -75,8 +81,7 @@ public final class TrashSlotInventoryAdapter implements SharableAdapter {
         }
         ItemStack stack = ItemStack.EMPTY;
         if (!item.isEmpty()) {
-            stack = ItemStack.parse(lookup, item)
-                    .orElseThrow(() -> invalid("trash item cannot be decoded"));
+            stack = dev.yu.mwi.adapter.vanilla.ItemStackSemantics.decode(item, lookup);
         }
         set(player, stack.copy());
     }

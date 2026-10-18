@@ -64,6 +64,15 @@ final class RecoveryExecutor implements AutoCloseable {
         }
     }
 
+    <T> CompletableFuture<T> detached(IoSupplier<T> action) {
+        CompletableFuture<T> result = new CompletableFuture<>();
+        try { executor.execute(() -> {
+            try { result.complete(action.get()); }
+            catch (IOException | RuntimeException failure) { result.completeExceptionally(failure); }
+        }); } catch (RejectedExecutionException failure) { result.completeExceptionally(failure); }
+        return result;
+    }
+
     @FunctionalInterface interface IoSupplier<T> { T get() throws IOException; }
     private record Flight(Object operation, CompletableFuture<dev.yu.mwi.storage.RecoveryInspection> result) {}
 }

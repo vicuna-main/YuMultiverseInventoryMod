@@ -724,8 +724,12 @@ public final class MwiCommands {
             MwiServerController controller,
             ServerPlayer player,
             long revision) throws Exception {
-        controller.requireService().recover(player, revision);
-        success(source, "Recovered revision " + revision + " for " + player.getGameProfile().getName());
+        var task = controller.requireService().requestRestore(player.getUUID(), "#" + revision, source.getTextName());
+        success(source, "已接收恢复任务 " + task.id() + "；完整状态可使用 /mwi restore " + player.getGameProfile().getName() + " status 查询");
+        task.completion().whenComplete((message, error) -> source.getServer().execute(() -> {
+            if (error == null) success(source, message);
+            else failure(source, "恢复未完成：" + error.getMessage());
+        }));
         return 1;
     }
 

@@ -37,6 +37,14 @@ public interface SharableAdapter {
         return java.util.Objects.equals(first, second);
     }
 
+    default RestoreVerification verifyRestored(ServerPlayer player, CompoundTag expected,
+            CompoundTag actual, HolderLookup.Provider registries) {
+        return RestoreVerification.strict(equivalent(expected, actual), actual);
+    }
+
+    default java.util.Optional<RecoveryEscrow> prepareRecoveryEscrow(ServerPlayer player, CompoundTag expected,
+            HolderLookup.Provider registries) { return java.util.Optional.empty(); }
+
     void clear(ServerPlayer player);
 
     void apply(ServerPlayer player, CompoundTag data, HolderLookup.Provider lookup);

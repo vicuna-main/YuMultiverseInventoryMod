@@ -13,6 +13,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 abstract class RecoveryPlayerDataMixin {
     @Inject(method = "save", at = @At("HEAD"), cancellable = true)
     private void mwi$excludeRecoveryDisplay(Player player, CallbackInfo ci) {
-        if (player instanceof ServerPlayer serverPlayer && RecoveryLoginFence.held(serverPlayer)) ci.cancel();
+        if (player instanceof ServerPlayer serverPlayer && RecoveryLoginFence.saveBlocked(serverPlayer)) ci.cancel();
     }
 }

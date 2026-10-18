@@ -131,6 +131,12 @@ final class ProfileSnapshotWriter implements AutoCloseable {
         remember(playerId, revision, writes);
     }
 
+    void commitEscrow(UUID owner, long revision, Map<ProfileKey, CompoundTag> writes,
+            dev.yu.mwi.storage.RecoveryMutation mutation, CompoundTag journal, java.util.List<ProfileArchive> archives) throws IOException {
+        queue.flush(owner); store.commitRecovery(owner, revision, writes, mutation, journal, archives);
+        remember(owner, revision, writes);
+    }
+
     void commitImmediately(
             UUID playerId,
             long revision,

@@ -55,6 +55,12 @@ public final class CosmeticArmorInventoryAdapter implements SharableAdapter, Ite
     }
 
     @Override
+    public dev.yu.mwi.api.RestoreVerification verifyRestored(ServerPlayer player, CompoundTag expected,
+            CompoundTag actual, HolderLookup.Provider lookup) {
+        return dev.yu.mwi.adapter.vanilla.ItemPayloadVerification.cosmetic(expected, actual, lookup);
+    }
+
+    @Override
     public boolean available(ServerPlayer player) {
         Object inventory = findInventory(player);
         return inventory != null && slotCount(inventory) > 0;
@@ -168,8 +174,7 @@ public final class CosmeticArmorInventoryAdapter implements SharableAdapter, Ite
                 throw invalid("duplicate Cosmetic Armor slot " + slot);
             }
             if (entry.contains("id")) {
-                ItemStack.parse(lookup, entry).orElseThrow(
-                        () -> invalid("Cosmetic Armor slot " + slot + " contains an invalid item"));
+                dev.yu.mwi.adapter.vanilla.ItemStackSemantics.decode(entry, lookup);
             } else if (!entry.getBoolean("isSkinArmor")) {
                 throw invalid("Cosmetic Armor slot " + slot + " contains neither an item nor a skin flag");
             }

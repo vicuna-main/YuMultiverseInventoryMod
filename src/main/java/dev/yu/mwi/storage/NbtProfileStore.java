@@ -304,7 +304,8 @@ public final class NbtProfileStore implements ProfileStore {
             writes.add(write);
         }
         ListTag archiveWrites = prepareArchiveWrites(playerId, revision, archives, profiles);
-        if (writes.isEmpty() && archiveWrites.isEmpty() && recoveryWrite.isEmpty()) {
+        if (writes.isEmpty() && archiveWrites.isEmpty() && recoveryWrite.isEmpty()
+                && completedJournal.map(j -> !j.contains("restore_context")).orElse(true)) {
             if (completedJournal.isPresent()) {
                 writeRevision(playerId, revision, completedJournal.orElseThrow());
             }
@@ -1107,6 +1108,13 @@ public final class NbtProfileStore implements ProfileStore {
         try {
             commitBatchLocked(playerId, revision, profiles, Optional.empty(), List.of(), Optional.of(mutation));
         } finally { lock.unlock(); }
+    }
+
+    @Override public void commitRecovery(UUID owner, long revision, Map<ProfileKey, CompoundTag> profiles,
+            RecoveryMutation mutation, CompoundTag journal, List<ProfileArchive> archives) throws IOException {
+        ReentrantLock lock = acquirePersistenceLock(owner);
+        try { commitBatchLocked(owner, revision, profiles, Optional.of(journal), archives, Optional.of(mutation)); }
+        finally { lock.unlock(); }
     }
 
     @Override
@@ -1944,6 +1952,25 @@ public final class NbtProfileStore implements ProfileStore {
     }
 
     private Path headsPath(UUID owner) { return root.resolve("committed_heads").resolve(owner + ".dat"); }
+
+    @Override public CompoundTag activationTask(UUID owner) throws IOException {
+        Path file = root.resolve("activation_tasks").resolve(owner + ".dat");
+        if (!Files.exists(file)) return new CompoundTag();
+        CompoundTag document = AtomicNbtFile.read(file);
+        RecoveryIncidentJournal.verify(file, document);
+        if (document.getInt("schema_version") != 1 || !document.hasUUID("player_uuid")
+                || !owner.equals(document.getUUID("player_uuid")) || !document.contains("task", Tag.TAG_COMPOUND))
+            throw new ProfileCorruptionException(file, "Invalid activation task identity");
+        return document.getCompound("task").copy();
+    }
+
+    @Override public void saveActivationTask(UUID owner, CompoundTag task) throws IOException {
+        CompoundTag document = new CompoundTag();
+        document.putInt("schema_version", 1); document.putUUID("player_uuid", owner);
+        document.put("task", task.copy()); document.putLong("updated_at", Instant.now().toEpochMilli());
+        RecoveryIncidentJournal.seal(document);
+        AtomicNbtFile.write(root.resolve("activation_tasks").resolve(owner + ".dat"), document, faultInjector);
+    }
     private Path committedPath(UUID owner, long revision) {
         return root.resolve("committed_batches").resolve(owner.toString()).resolve(revision + ".dat");
     }
@@ -1997,6 +2024,9 @@ public final class NbtProfileStore implements ProfileStore {
         AtomicNbtFile.write(source, transaction, faultInjector);
         verifyTransaction(source, AtomicNbtFile.readTransaction(source));
         CompoundTag heads = readHeads(owner);
+        String retainedTransactionHash = NbtChecksums.canonicalSha256(transaction);
+        boolean newerHeads = heads.getList("profiles", Tag.TAG_COMPOUND).stream()
+                .anyMatch(tag -> ((CompoundTag) tag).getLong("revision") > revision);
         Map<ProfileKey, CompoundTag> entries = new LinkedHashMap<>();
         for (Tag tag : heads.getList("profiles", Tag.TAG_COMPOUND)) {
             CompoundTag entry = (CompoundTag) tag;
@@ -2010,12 +2040,38 @@ public final class NbtProfileStore implements ProfileStore {
             head.put("key", encodeKey(key));
             head.putLong("revision", revision);
             head.putString("document_sha256", NbtChecksums.canonicalSha256(write.getCompound("document")));
+            head.putString("payload_sha256", NbtChecksums.canonicalSha256(write.getCompound("document").getCompound("payload")));
+            head.putString("transaction_sha256", retainedTransactionHash);
             entries.put(key, head);
         }
         ListTag encoded = new ListTag(); entries.values().forEach(encoded::add);
         heads.put("profiles", encoded);
+        CompoundTag journal = transaction.getCompound("journal");
+        if (!newerHeads && journal.contains("restore_context", Tag.TAG_COMPOUND)) heads.put("context", journal.getCompound("restore_context").copy());
+        if (journal.contains("restore_operation", Tag.TAG_COMPOUND)) {
+            CompoundTag request = journal.getCompound("restore_operation").copy();
+            // Replay must neither downgrade ACTIVE nor replace a newer prepared request.
+            if (restoreOperation(owner, request.getUUID("operation_id")).isEmpty()) {
+                request.putString("state", "COMMITTED"); request.putLong("committed_revision", revision);
+                saveRestoreRequest(owner, request);
+            }
+        }
         RecoveryIncidentJournal.seal(heads);
         AtomicNbtFile.write(headsPath(owner), heads, faultInjector);
+        Path pointPath = restorePointPath(owner, revision);
+        if (!newerHeads && !Files.exists(pointPath)) {
+            CompoundTag point = heads.copy();
+            point.putLong("revision", revision);
+            long committedAt = 0;
+            for (Tag tag : transaction.getList("profiles", Tag.TAG_COMPOUND))
+                committedAt = Math.max(committedAt, ((CompoundTag) tag).getCompound("document").getLong("saved_at"));
+            // Recovery-only commits have no inventory delta and are not new inventory restore points.
+            if (committedAt > 0) {
+                point.putLong("committed_at", committedAt);
+                RecoveryIncidentJournal.seal(point);
+                AtomicNbtFile.write(pointPath, point, faultInjector);
+            }
+        }
         pruneCommittedCopies(owner, entries.values());
     }
 
@@ -2023,6 +2079,14 @@ public final class NbtProfileStore implements ProfileStore {
         try {
             java.util.Set<Long> keep = new HashSet<>();
             heads.forEach(head -> keep.add(head.getLong("revision")));
+            List<Path> points = new ArrayList<>(playerDocuments("restore_points", owner));
+            java.util.Collections.reverse(points);
+            for (int index = 0; index < points.size(); index++) {
+                Path file = points.get(index);
+                CompoundTag point = AtomicNbtFile.read(file); RecoveryIncidentJournal.verify(file, point);
+                if (index >= maxRevisions) { AtomicNbtFile.deleteDurably(file); continue; }
+                for (Tag tag : point.getList("profiles", Tag.TAG_COMPOUND)) keep.add(((CompoundTag) tag).getLong("revision"));
+            }
             List<Path> all = new ArrayList<>(playerDocuments("committed_batches", owner));
             java.util.Collections.reverse(all);
             for (int index = 0; index < Math.min(maxRevisions, all.size()); index++) keep.add(checkedRevision(all.get(index)));
@@ -2035,6 +2099,108 @@ public final class NbtProfileStore implements ProfileStore {
         } catch (IOException failure) {
             LOGGER.warn("Committed recovery copies retained because pruning could not be verified for {}", owner, failure);
         }
+    }
+
+    private Path restorePointPath(UUID owner, long revision) {
+        return root.resolve("restore_points").resolve(owner.toString()).resolve(revision + ".dat");
+    }
+
+    @Override public CompoundTag restoreContext(UUID owner) throws IOException { return readHeads(owner).getCompound("context").copy(); }
+
+    @Override public List<RestorePoint> restorePoints(UUID owner) throws IOException {
+        List<RestorePoint> result = new ArrayList<>();
+        java.util.Set<Long> manifested = new HashSet<>();
+        for (Path file : playerDocuments("restore_points", owner)) {
+            CompoundTag point = AtomicNbtFile.read(file); RecoveryIncidentJournal.verify(file, point);
+            long revision = checkedRevision(file);
+            if (!point.hasUUID("player_uuid") || !owner.equals(point.getUUID("player_uuid"))
+                    || point.getLong("revision") != revision || point.getLong("committed_at") <= 0)
+                throw new ProfileCorruptionException(file, "Invalid restore point identity/time");
+            Map<ProfileKey, StoredProfile> profiles = new LinkedHashMap<>();
+            java.util.Set<ProfileKey> seen = new HashSet<>();
+            List<String> problems = new ArrayList<>();
+            Map<Long, CompoundTag> batches = new LinkedHashMap<>();
+            Map<Long, String> batchHashes = new LinkedHashMap<>();
+            for (Tag tag : point.getList("profiles", Tag.TAG_COMPOUND)) {
+                CompoundTag ref = (CompoundTag) tag; ProfileKey key = decodeKey(ref.getCompound("key"));
+                if (!key.playerId().equals(owner) || !seen.add(key))
+                    throw new ProfileCorruptionException(file, "Invalid restore point profile identity");
+                long sourceRevision = ref.getLong("revision");
+                if (sourceRevision < 1 || sourceRevision > revision) throw new ProfileCorruptionException(file, "Future restore reference");
+                try {
+                    CompoundTag batch = batches.get(sourceRevision);
+                    Path source = committedPath(owner, sourceRevision);
+                    if (batch == null) {
+                        batch = AtomicNbtFile.readTransaction(source); verifyTransaction(source, batch);
+                        if (!owner.equals(batch.getUUID("player_uuid")) || batch.getLong("revision") != sourceRevision)
+                            throw new IOException("Referenced transaction identity differs");
+                        batches.put(sourceRevision, batch);
+                        batchHashes.put(sourceRevision, NbtChecksums.canonicalSha256(batch));
+                    }
+                    CompoundTag document = null;
+                    for (Tag write : batch.getList("profiles", Tag.TAG_COMPOUND)) {
+                        CompoundTag candidate = (CompoundTag) write;
+                        if (key.equals(decodeKey(candidate.getCompound("key")))) document = candidate.getCompound("document");
+                    }
+                    if (document == null || !ref.getString("document_sha256").equals(NbtChecksums.canonicalSha256(document)))
+                        throw new IOException("Referenced profile document differs");
+                    if (ref.contains("payload_sha256") && !ref.getString("payload_sha256").equals(NbtChecksums.canonicalSha256(document.getCompound("payload"))))
+                        throw new IOException("Referenced payload differs");
+                    if (ref.contains("transaction_sha256") && !ref.getString("transaction_sha256").equals(batchHashes.get(sourceRevision)))
+                        throw new IOException("Referenced commit differs");
+                    profiles.put(key, new StoredProfile(document.getCompound("payload"), document.getLong("revision"),
+                            Instant.ofEpochMilli(document.getLong("saved_at")), document.getString("checksum")));
+                } catch (IOException invalid) { problems.add(key.shareId() + ": " + invalid.getMessage()); }
+            }
+            result.add(new RestorePoint(revision, Instant.ofEpochMilli(point.getLong("committed_at")), profiles, problems, "manifest"));
+            manifested.add(revision);
+        }
+        // A legacy batch is usable only when that one verified commit contains every required key.
+        // An incremental batch remains partial; missing dependencies are never filled from today's state.
+        for (Path file : playerDocuments("committed_batches", owner)) {
+            long revision = checkedRevision(file); if (manifested.contains(revision)) continue;
+            CompoundTag batch = AtomicNbtFile.readTransaction(file); verifyTransaction(file, batch);
+            Map<ProfileKey, StoredProfile> profiles = new LinkedHashMap<>(); long time = 0;
+            for (Tag tag : batch.getList("profiles", Tag.TAG_COMPOUND)) {
+                CompoundTag write = (CompoundTag) tag, doc = write.getCompound("document");
+                ProfileKey key = decodeKey(write.getCompound("key"));
+                time = Math.max(time, doc.getLong("saved_at"));
+                profiles.put(key, new StoredProfile(doc.getCompound("payload"), revision,
+                        Instant.ofEpochMilli(doc.getLong("saved_at")), doc.getString("checksum")));
+            }
+            if (time > 0) result.add(new RestorePoint(revision, Instant.ofEpochMilli(time), profiles,
+                    List.of(), "legacy-batch"));
+        }
+        result.sort(Comparator.comparing(RestorePoint::committedAt).reversed().thenComparing(RestorePoint::revision));
+        return List.copyOf(result);
+    }
+
+    @Override public CompoundTag restoreRequest(UUID owner) throws IOException {
+        Path file = root.resolve("restore_requests").resolve(owner + ".dat");
+        if (!Files.exists(file)) return new CompoundTag();
+        CompoundTag doc = AtomicNbtFile.read(file); RecoveryIncidentJournal.verify(file, doc);
+        if (!doc.hasUUID("player_uuid") || !owner.equals(doc.getUUID("player_uuid")) || doc.getInt("schema_version") != 1)
+            throw new ProfileCorruptionException(file, "Invalid restore request identity");
+        return doc.getCompound("request").copy();
+    }
+
+    @Override public void saveRestoreRequest(UUID owner, CompoundTag request) throws IOException {
+        CompoundTag doc = new CompoundTag(); doc.putInt("schema_version", 1); doc.putUUID("player_uuid", owner);
+        doc.put("request", request.copy()); RecoveryIncidentJournal.seal(doc);
+        AtomicNbtFile.write(root.resolve("restore_requests").resolve(owner + ".dat"), doc, faultInjector);
+        if (request.hasUUID("operation_id") && java.util.Set.of("COMMITTED", "ACTIVE").contains(request.getString("state")))
+            AtomicNbtFile.write(root.resolve("restore_operations").resolve(owner.toString())
+                    .resolve(request.getUUID("operation_id") + ".dat"), doc, faultInjector);
+    }
+
+    @Override public Optional<CompoundTag> restoreOperation(UUID owner, UUID operation) throws IOException {
+        Path file = root.resolve("restore_operations").resolve(owner.toString()).resolve(operation + ".dat");
+        if (!Files.exists(file)) return Optional.empty();
+        CompoundTag doc = AtomicNbtFile.read(file); RecoveryIncidentJournal.verify(file, doc);
+        CompoundTag request = doc.getCompound("request");
+        if (!owner.equals(doc.getUUID("player_uuid")) || !request.hasUUID("operation_id") || !operation.equals(request.getUUID("operation_id")))
+            throw new ProfileCorruptionException(file, "Restore operation identity differs");
+        return Optional.of(request.copy());
     }
 
     private void prepareExactRepair(UUID owner, java.util.Set<ProfileKey> damaged) throws IOException {

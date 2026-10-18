@@ -12,6 +12,7 @@ import java.util.UUID;
 public final class AutomaticRecoveryCommands {
     private AutomaticRecoveryCommands() {}
     public static void register(CommandDispatcher<CommandSourceStack> dispatcher, MwiServerController controller) {
+        RestoreCommands.register(dispatcher, controller);
         dispatcher.register(Commands.literal("mwi").requires(source -> source.hasPermission(2))
                 .then(Commands.literal("recovery")
                         .then(Commands.literal("inspect").then(Commands.argument("uuid", UuidArgument.uuid())
@@ -35,6 +36,7 @@ public final class AutomaticRecoveryCommands {
                                 + " 未决事务/元数据=" + result.pending().size() + " 尝试=" + result.attempts()
                                 + " 耗时=" + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) + "ms"), false);
                         result.pending().stream().limit(8).forEach(problem -> source.sendFailure(Component.literal(problem)));
+                        source.sendSuccess(() -> Component.literal(controller.requireService().recoveryStatus(owner)), false);
                     }
                 }));
         return 1;

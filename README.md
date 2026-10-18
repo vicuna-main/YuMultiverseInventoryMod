@@ -285,8 +285,9 @@ MVInv 5.3.5 的档案格式只包含背包、末影箱、盔甲和副手，不�
 alias，执行 `/mwi reload`，再对受影响玩家运行 repair dry-run 和 apply。真正的 NBT 类型错误、非法 ID/
 时间、重复原生条目或 checksum 错误仍会严格失败，不会被兼容模式掩盖。
 
-物品注册表漂移默认使用 `item_migration.missing_item_policy = "quarantine_and_continue"`：坏 stack
-原位变为空槽，其他槽不移动并继续恢复。需要旧行为时可改为 `strict_fail`。确定性改名可配置：
+物品注册表漂移的显式修复默认使用 `item_migration.missing_item_policy = "quarantine_and_continue"`：坏 stack
+归档后原位变为空槽，其他槽不移动。1.4.0 自动登录激活遇到缺失注册项会先保留原档案并等待处理，不用空槽表示恢复成功。
+需要严格拒绝迁移时可改为 `strict_fail`。确定性改名可配置：
 
 ```toml
 [item_migration]
@@ -307,6 +308,8 @@ MWI 会继续当前登录、保存或世界切换事务，不再因为这一项�
 其他结构性损坏仍保持严格失败。
 
 ## 构建与验证
+
+1.4.0 的名称／时间恢复命令、语义校验、恢复大厅、测试条件和升级／回退步骤见 [恢复说明](docs/restore-1.4.md)。
 
 ```powershell
 .\gradlew.bat test

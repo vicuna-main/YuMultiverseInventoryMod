@@ -157,6 +157,7 @@ dependencies {
 
 tasks.named('test', Test).configure {
     useJUnitPlatform()
+    if (project.hasProperty('restoreFixture')) systemProperty 'mwi.restoreFixture', project.property('restoreFixture')
 }
 
 // Opt-in integration tests execute the real login/event/mixin path in a disposable server world.

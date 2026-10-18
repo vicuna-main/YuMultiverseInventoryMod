@@ -46,6 +46,7 @@ public final class RecoveryNotifications {
         if (player == null || player.isRemoved()) return;
         task.due = now + 3000;
         try {
+            if (dev.yu.mwi.platform.RecoveryLoginFence.held(player)) { pending.put(owner, task); return; }
             if (!player.isAlive() || !authenticated(player)) { pending.put(owner, task); return; }
             RecoveryCenter center = RecoveryBridgeV1.service(player);
             String session = center.sessionToken(player);

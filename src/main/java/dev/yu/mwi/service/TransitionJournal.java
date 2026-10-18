@@ -92,7 +92,7 @@ final class TransitionJournal {
         return List.copyOf(result);
     }
 
-    private static CompoundTag encodeKey(ProfileKey key) {
+    static CompoundTag encodeKey(ProfileKey key) {
         CompoundTag tag = new CompoundTag();
         tag.putUUID("player_uuid", key.playerId());
         tag.putString("scope_type", key.scope().type().name());
@@ -102,7 +102,7 @@ final class TransitionJournal {
         return tag;
     }
 
-    private static ProfileKey decodeKey(CompoundTag tag) {
+    static ProfileKey decodeKey(CompoundTag tag) {
         if (!tag.hasUUID("player_uuid")) {
             throw new IllegalArgumentException("Revision profile key has no player UUID");
         }

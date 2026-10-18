@@ -110,7 +110,10 @@ class SideEffectFreeTransactionSourceTest {
         int initializeStart = source.indexOf("private void initialize");
         int reconcileStart = source.indexOf("private void reconcile", initializeStart);
         String initialize = source.substring(initializeStart, reconcileStart);
-        assertTrue(initialize.indexOf("store.writeRevision") < initialize.indexOf("replace(player"));
+        // The detached login input is already durable while fenced. Validate application before
+        // allocating/committing an authoritative revision; deterministic failures cannot grow history.
+        assertTrue(initialize.indexOf("replace(player") < initialize.indexOf("verifyLoginApplication(player"));
+        assertTrue(initialize.indexOf("verifyLoginApplication(player") < initialize.indexOf("revision = nextRevision(player)"));
         assertTrue(initialize.contains("snapshotWriter.commitImmediately"));
 
         int migrationStart = source.indexOf("private CompoundTag migrateGroupTarget", reconcileStart);
