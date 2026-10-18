@@ -33,6 +33,11 @@ public final class PotionEffectsAdapter extends AbstractVanillaAdapter {
         super(AdapterIds.POTION_EFFECTS);
     }
 
+    public PotionEffectPayloads.RemovedEffects prepareAfterUninstall(CompoundTag payload) {
+        return PotionEffectPayloads.prepareAfterUninstall(payload, BuiltInRegistries.MOB_EFFECT::containsKey,
+                namespace -> net.neoforged.fml.ModList.get().isLoaded(namespace));
+    }
+
     @Override
     public CompoundTag capture(ServerPlayer player, HolderLookup.Provider lookup) {
         List<MobEffectInstance> active = new ArrayList<>(player.getActiveEffects());
@@ -47,7 +52,18 @@ public final class PotionEffectsAdapter extends AbstractVanillaAdapter {
         }
         CompoundTag data = new CompoundTag();
         data.put(EFFECTS, encoded);
-        return data;
+        return PotionEffectPayloads.normalize(data);
+    }
+
+    @Override
+    public boolean equivalent(CompoundTag first, CompoundTag second) {
+        return PotionEffectPayloads.verify(first, second).accepted();
+    }
+
+    @Override
+    public dev.yu.mwi.api.RestoreVerification verifyRestored(ServerPlayer player, CompoundTag expected,
+            CompoundTag actual, HolderLookup.Provider lookup) {
+        return PotionEffectPayloads.verify(expected, actual);
     }
 
     @Override
@@ -68,7 +84,7 @@ public final class PotionEffectsAdapter extends AbstractVanillaAdapter {
     @Override
     public void apply(ServerPlayer player, CompoundTag data, HolderLookup.Provider lookup) {
         NbtPayload.requireData(data, id().toString());
-        ListTag encoded = NbtPayload.requireCompoundList(data, EFFECTS, id().toString());
+        ListTag encoded = NbtPayload.requireCompoundList(PotionEffectPayloads.normalize(data), EFFECTS, id().toString());
         List<MobEffectInstance> decoded = new ArrayList<>(encoded.size());
         Set<Holder<MobEffect>> seen = new HashSet<>();
         DynamicOps<Tag> ops = NbtOps.INSTANCE;

@@ -1,6 +1,6 @@
 package dev.yu.mwi.recovery;
 
-import dev.yu.mwi.api.RecoveryBridgeV1;
+import dev.yu.mwi.recovery.RecoveryServices;
 import dev.yu.mwi.storage.StoredRecovery;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
@@ -36,7 +36,11 @@ public final class RecoveryMenu extends ChestMenu {
 
     public static void open(ServerPlayer player, UUID source, int page, boolean automatic) throws IOException {
         RecoveryNotifications.requireAuthenticated(player);
-        RecoveryCenter center = RecoveryBridgeV1.service(player);
+        if (dev.yu.mwi.platform.RecoveryLoginFence.held(player)) {
+            player.sendSystemMessage(Component.literal(dev.yu.mwi.platform.RecoveryLoginFence.status(player)));
+            return;
+        }
+        RecoveryCenter center = RecoveryServices.service(player);
         if (!player.isAlive()) throw new IOException("请复活后打开恢复中心");
         player.closeContainer();
         RecoveryCenter.Preview preview = source == null ? null : center.preview(player, source);
@@ -51,16 +55,17 @@ public final class RecoveryMenu extends ChestMenu {
             if (preview != null) display.setItem(slot, items.get(offset + slot).copy());
             else {
                 StoredRecovery record = cases.get(offset + slot);
-                String state = record.payload().getString("state");
+                String state = RecoverySourcePolicy.nativeSource(record.payload()) ? record.payload().getString("state") : "HISTORY";
                 display.setItem(slot, icon("AVAILABLE".equals(state) ? Items.CHEST : Items.PAPER,
-                        ("AVAILABLE".equals(state) ? "物品已托管 · 查看领取条件 · " : "待核验 · ") + record.sourceId()));
+                        ("HISTORY".equals(state) ? "历史记录 · 只读 · " : "AVAILABLE".equals(state) ? "物品已托管 · 查看领取条件 · " : "待核验 · ") + record.sourceId()));
             }
         }
         display.setItem(45, icon(Items.ARROW, "上一页"));
         display.setItem(53, icon(Items.ARROW, "下一页"));
         display.setItem(48, icon(Items.BOOK, "返回恢复记录"));
         display.setItem(49, icon(preview != null && "AVAILABLE".equals(preview.state()) ? Items.EMERALD : Items.PAPER,
-                preview == null ? "点击上方记录查看物品" : !preview.warning().isEmpty() && "AVAILABLE".equals(preview.state())
+                preview == null ? "点击上方记录查看物品" : "HISTORY".equals(preview.state()) ? "历史记录 · 仅供查阅"
+                        : !preview.warning().isEmpty() && "AVAILABLE".equals(preview.state())
                         ? "暂不可领取 · 请查看右侧原因" : "AVAILABLE".equals(preview.state())
                         ? "确认恢复 · 空间不足的物品继续托管" : "申请管理员核验 · 不会自动补发"));
         display.setItem(50, icon(Items.BARRIER, preview != null && !preview.warning().isEmpty()
@@ -90,7 +95,7 @@ public final class RecoveryMenu extends ChestMenu {
                 open(owner, cases.get(page * PAGE_SIZE + slot).sourceId(), 0);
             else if (slot == 49 && preview != null) {
                 RecoveryNotifications.viewed(owner, preview.id());
-                if ("AVAILABLE".equals(preview.state()) && !preview.warning().isEmpty()) {
+                if ("HISTORY".equals(preview.state()) || !preview.warning().isEmpty() && "AVAILABLE".equals(preview.state())) {
                     owner.sendSystemMessage(Component.literal("[背包恢复] " + preview.warning())); return;
                 }
                 submitted = true;

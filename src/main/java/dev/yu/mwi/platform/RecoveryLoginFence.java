@@ -24,6 +24,10 @@ public final class RecoveryLoginFence {
         InventoryIsolationService service = service(player);
         return service != null && service.isRecoveryHeld(player);
     }
+    public static String status(ServerPlayer player) {
+        InventoryIsolationService service = service(player);
+        return service == null ? "恢复服务尚未就绪" : service.recoveryStatus(player.getUUID());
+    }
     public static void loaded(ServerPlayer player, net.minecraft.nbt.CompoundTag input) {
         InventoryIsolationService service = service(player);
         if (service != null) service.captureLoadedPlayer(player, input);

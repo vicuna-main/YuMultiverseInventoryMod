@@ -158,6 +158,7 @@ dependencies {
 tasks.named('test', Test).configure {
     useJUnitPlatform()
     if (project.hasProperty('restoreFixture')) systemProperty 'mwi.restoreFixture', project.property('restoreFixture')
+    if (project.hasProperty('serverIncidentFixture')) systemProperty 'mwi.serverIncidentFixture', project.property('serverIncidentFixture')
 }
 
 // Opt-in integration tests execute the real login/event/mixin path in a disposable server world.
@@ -166,6 +167,7 @@ if (project.hasProperty('automaticRecoveryGameTests')) {
         gameTest {
             compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
             runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+            if (project.hasProperty('standaloneSmoke')) java.setSrcDirs(['src/smokeTest/java'])
         }
     }
     runs.gameTestServer {

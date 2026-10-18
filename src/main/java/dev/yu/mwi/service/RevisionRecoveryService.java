@@ -104,7 +104,6 @@ final class RevisionRecoveryService {
         for (var summary : store.listRecoveries(owner)) {
             var payload = store.loadRecovery(owner, summary.sourceId()).orElseThrow(() -> new IOException("恢复凭证读取不完整")).payload();
             var identity = payload.getCompound("identity");
-            if ("grave_claim".equals(identity.getCompound("evidence").getString("type"))) continue;
             for (ProfileKey key : itemKeys) {
                 var scope = identity.getCompound("scope").getCompound(key.shareId());
                 if (key.scope().type().name().equals(scope.getString("scope_type"))

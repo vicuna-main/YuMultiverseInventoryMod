@@ -87,7 +87,7 @@ public final class MwiServerController {
         adapters = candidateAdapters;
         service = candidateService;
         RecoveryLoginFence.register(startingServer, service);
-        dev.yu.mwi.api.RecoveryBridgeV1.register(startingServer, service.recoveryCenter());
+        dev.yu.mwi.recovery.RecoveryServices.register(startingServer, service.recoveryCenter());
         pendingLogouts.clear();
         logger.info("Yu Multiverse Inventory started with {} adapters and {} world groups",
                 candidateAdapters.size(), config.model().groups().size());
@@ -103,7 +103,7 @@ public final class MwiServerController {
         try {
             service.close();
         } finally {
-            dev.yu.mwi.api.RecoveryBridgeV1.unregister(stoppingServer);
+            dev.yu.mwi.recovery.RecoveryServices.unregister(stoppingServer);
             RecoveryLoginFence.unregister(stoppingServer);
             pendingLogouts.clear();
             service = null;

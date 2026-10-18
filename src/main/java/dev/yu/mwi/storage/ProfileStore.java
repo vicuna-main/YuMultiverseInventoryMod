@@ -20,6 +20,10 @@ public interface ProfileStore extends AutoCloseable {
         throw new IOException("This profile store does not support durable restore requests");
     }
     default CompoundTag activationTask(UUID owner) throws IOException { return new CompoundTag(); }
+    default CompoundTag restoreResult(UUID owner) throws IOException { return new CompoundTag(); }
+    default void saveRestoreResult(UUID owner, CompoundTag result) throws IOException {
+        throw new IOException("This profile store does not support durable restore results");
+    }
     default void saveActivationTask(UUID owner, CompoundTag task) throws IOException {
         throw new IOException("This profile store does not support durable activation tasks");
     }
