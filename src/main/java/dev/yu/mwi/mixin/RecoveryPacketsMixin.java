@@ -16,11 +16,15 @@ abstract class RecoveryPacketsMixin {
 
     @Inject(method = {"handleContainerClick", "handleContainerButtonClick", "handleSetCreativeModeSlot",
             "handlePlayerAction", "handleUseItem", "handleUseItemOn", "handleInteract", "handleSetCarriedItem",
-            "handlePlayerCommand", "handleTeleportToEntityPacket", "handleMovePlayer", "handleMoveVehicle",
+            "handlePlayerCommand", "handleTeleportToEntityPacket", "handleMoveVehicle",
             "handlePlayerAbilities", "handlePlaceRecipe", "handlePickItem", "handleCustomPayload"},
             at = @At("HEAD"), cancellable = true)
     private void mwi$blockRecoveryTransfers(CallbackInfo ci) {
         if (RecoveryLoginFence.externalTransferBlocked(player)) ci.cancel();
+    }
+    @Inject(method = "handleMovePlayer", at = @At("HEAD"), cancellable = true)
+    private void mwi$allowRecoveryLobbyMovement(CallbackInfo ci) {
+        if (RecoveryLoginFence.movementBlocked(player)) ci.cancel();
     }
 
     @Inject(method = "handleChatCommand", at = @At("HEAD"), cancellable = true)

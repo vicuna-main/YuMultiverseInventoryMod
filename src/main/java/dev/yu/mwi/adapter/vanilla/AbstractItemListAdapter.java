@@ -18,6 +18,12 @@ abstract class AbstractItemListAdapter extends AbstractVanillaAdapter {
     protected abstract void setChanged(ServerPlayer player);
 
     @Override
+    public dev.yu.mwi.api.RestoreVerification verifyRestored(ServerPlayer player, CompoundTag expected,
+            CompoundTag actual, HolderLookup.Provider lookup) {
+        return ItemPayloadVerification.verify(expected, actual, lookup, false);
+    }
+
+    @Override
     public final CompoundTag capture(ServerPlayer player, HolderLookup.Provider lookup) {
         return ItemListNbtCodec.encode(slots(player), lookup);
     }

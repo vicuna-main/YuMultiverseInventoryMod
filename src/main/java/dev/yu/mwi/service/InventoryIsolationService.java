@@ -84,6 +84,8 @@ public final class InventoryIsolationService implements AutoCloseable {
     private final Set<UUID> activeTransactions = ConcurrentHashMap.newKeySet();
     private final Set<UUID> quarantinedPlayers = ConcurrentHashMap.newKeySet();
     private final Map<UUID, RecoveryHold> recoveryHolds = new ConcurrentHashMap<>();
+    private final Map<UUID, RestoreCommandTask> restoreCommands = new HashMap<>();
+    public record RestoreCommandTask(UUID id, String selector, java.util.concurrent.CompletableFuture<String> completion) {}
     private final Set<ServerPlayer> retiredRecoveryPlayers = Collections.synchronizedSet(
             Collections.newSetFromMap(new java.util.WeakHashMap<>()));
     private final Map<UUID, Long> backgroundRecoveryAt = new HashMap<>();
@@ -378,6 +380,7 @@ public final class InventoryIsolationService implements AutoCloseable {
             RecoveryHold hold = recoveryHolds.get(player.getUUID());
             if (hold == null) return;
             hold.disconnected = true;
+            if (hold.completion != null) hold.completion.completeExceptionally(new IOException("玩家已离线，恢复任务保留，待下次登录核验"));
             retiredRecoveryPlayers.add(player);
             recoveryHolds.remove(player.getUUID(), hold);
             backgroundRecoveryAt.put(player.getUUID(), nextRecoveryTime());
@@ -644,22 +647,55 @@ public final class InventoryIsolationService implements AutoCloseable {
             LinkedHashSet<UUID> candidates = new LinkedHashSet<>(store.listPlayerProfileIds().playerIds());
             server.getPlayerList().getPlayers().forEach(player -> candidates.add(player.getUUID()));
             List<UUID> matches = candidates.stream()
-                    .filter(playerId -> server.getProfileCache().get(playerId)
-                            .map(profile -> profile.getName().equalsIgnoreCase(requested))
-                            .orElse(false))
+                    .filter(playerId -> {
+                        ServerPlayer online = server.getPlayerList().getPlayer(playerId);
+                        return online != null && online.getGameProfile().getName().equalsIgnoreCase(requested)
+                                || server.getProfileCache() != null && server.getProfileCache().get(playerId)
+                                        .map(profile -> profile.getName().equalsIgnoreCase(requested)).orElse(false);
+                    })
                     .toList();
             if (matches.isEmpty()) {
                 throw new IllegalArgumentException(
-                        "Unknown cached player name '" + requested + "'; use a UUID for offline players");
+                        "未知玩家名称 '" + requested + "'；未创建身份或空背包，请核对已有用户名缓存");
             }
             if (matches.size() > 1) {
                 throw new IllegalArgumentException(
-                        "Cached player name '" + requested + "' is ambiguous; use a UUID");
+                        "玩家名称 '" + requested + "' 对应多个历史身份；请先核对用户名缓存，不会猜测身份");
             }
             return matches.getFirst();
         } catch (IOException failure) {
             throw new TransitionException("Unable to inspect known player profiles", failure);
         }
+    }
+
+    /** Side-effect-free inspection of every canonical bed-spawn profile for a player. */
+    public java.util.concurrent.CompletableFuture<List<String>> knownPlayerNames() {
+        requireServerThread();
+        return recoveryExecutor.detached(() -> store.listPlayerProfileIds().playerIds()).thenCompose(ids -> {
+            var result = new java.util.concurrent.CompletableFuture<List<String>>();
+            server.execute(() -> {
+                java.util.Set<String> names = new java.util.TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+                server.getPlayerList().getPlayers().forEach(player -> names.add(player.getGameProfile().getName()));
+                if (server.getProfileCache() != null) ids.forEach(id -> server.getProfileCache().get(id)
+                        .ifPresent(profile -> names.add(profile.getName())));
+                result.complete(List.copyOf(names));
+            });
+            return result;
+        });
+    }
+
+    public java.util.concurrent.CompletableFuture<List<String>> restoreTargets(UUID owner) {
+        requireServerThread();
+        RecoveryHold hold = recoveryHolds.get(owner); Session session = sessions.get(owner);
+        Set<ProfileKey> active = hold != null && hold.required != null ? hold.required
+                : session == null ? Set.of() : Set.copyOf(session.profiles().values());
+        java.time.ZoneId zone = restoreTimeZone();
+        return recoveryExecutor.detached(() -> {
+            Set<ProfileKey> required = active.isEmpty() ? RestorePlans.keys(store.restoreContext(owner), owner) : active;
+            var points = store.restorePoints(owner);
+            return points.stream().filter(point -> point.completeFor(required)).limit(100)
+                    .map(point -> RestorePointSelector.label(point, zone, points)).distinct().toList();
+        });
     }
 
     /** Side-effect-free inspection of every canonical bed-spawn profile for a player. */
@@ -1634,7 +1670,7 @@ public final class InventoryIsolationService implements AutoCloseable {
         } finally {
             loginPerformance.recordCapture(initialCaptures, System.nanoTime() - initialCaptureStarted);
         }
-        long revision = nextRevision(player);
+        long revision = -1;
         List<TransitionJournal.Change> changes = new ArrayList<>();
         LinkedHashMap<ProfileKey, CompoundTag> canonicalBefore = new LinkedHashMap<>();
         Map<String, CompoundTag> incoming = new HashMap<>();
@@ -1708,12 +1744,23 @@ public final class InventoryIsolationService implements AutoCloseable {
                 }
                 changes.add(new TransitionJournal.Change(share, null, target, livePayload, null));
             }
+            RecoveryHold recoveryHold = recoveryHolds.get(player.getUUID());
+            if (recoveryHold != null && "PREPARED".equals(recoveryHold.request.getString("state"))) {
+                Map<String, CompoundTag> targets = RestorePlans.targets(recoveryHold.request, targetKeys, recoveryHold.inspection.profiles());
+                for (var entry : targets.entrySet()) {
+                    incoming.put(entry.getKey(), entry.getValue());
+                    writes.put(targetKeys.get(entry.getKey()), entry.getValue());
+                    archives.add(new ArchiveRequest(targetKeys.get(entry.getKey()), "administrator-restore", "before explicit historical restore"));
+                }
+            }
+            ActivationEscrow escrow = prepareActivationEscrow(player, activeAdapters, incoming, targetKeys);
             journal = TransitionJournal.preparedLogin(world.name(), changes, canonicalBefore);
-            store.writeRevision(player.getUUID(), revision, journal);
+            if (recoveryHold != null && "PREPARED".equals(recoveryHold.request.getString("state")))
+                journal.put("restore_operation", recoveryHold.request.copy());
             List<SharableAdapter> mutatedAdapters = new ArrayList<>();
             for (Map.Entry<String, SharableAdapter> entry : activeAdapters.entrySet()) {
                 CompoundTag payload = incoming.get(entry.getKey());
-                if (resetToDefault.contains(entry.getValue())
+                if ((escrow != null && escrow.share().equals(entry.getKey())) || resetToDefault.contains(entry.getValue())
                         || (payload != null && !entry.getValue().equivalent(payload, live.get(entry.getValue())))) {
                     mutatedAdapters.add(entry.getValue());
                 }
@@ -1722,7 +1769,7 @@ public final class InventoryIsolationService implements AutoCloseable {
                 for (Map.Entry<String, SharableAdapter> entry : activeAdapters.entrySet()) {
                     SharableAdapter adapter = entry.getValue();
                     CompoundTag payload = incoming.get(entry.getKey());
-                    if (resetToDefault.contains(adapter)) {
+                    if ((escrow != null && escrow.share().equals(entry.getKey())) || resetToDefault.contains(adapter)) {
                         adapter.clear(player);
                     } else if (payload != null && !adapter.equivalent(payload, live.get(adapter))) {
                         adapter.clear(player);
@@ -1737,6 +1784,12 @@ public final class InventoryIsolationService implements AutoCloseable {
                 for (Map.Entry<String, SharableAdapter> entry : activeAdapters.entrySet()) {
                     CompoundTag payload = entry.getValue().capture(player, player.registryAccess());
                     currentPayloads.put(entry.getKey(), payload);
+                    if (escrow != null && escrow.share().equals(entry.getKey())) {
+                        // The complete original equipment is exclusively owned by the same WAL's escrow mutation.
+                        incoming.put(entry.getKey(), payload.copy());
+                        writes.put(targetKeys.get(entry.getKey()), payload);
+                        archives.add(new ArchiveRequest(targetKeys.get(entry.getKey()), "activation-escrow", "unavailable Curios slot; complete dependency set escrowed"));
+                    }
                     if (resetToDefault.contains(entry.getValue())) {
                         writes.put(targetKeys.get(entry.getKey()), payload);
                     }
@@ -1746,14 +1799,18 @@ public final class InventoryIsolationService implements AutoCloseable {
                 loginPerformance.recordCapture(
                         finalCaptures, System.nanoTime() - finalCaptureStarted);
             }
+            verifyLoginApplication(player, activeAdapters, incoming, currentPayloads, targetKeys, writes, archives);
             if (WorldIdentities.from(player.serverLevel()).equals(world)) {
                 collectWorldBackups(player, world, targetKeys, activeAdapters, currentPayloads, writes);
             }
 
+            revision = nextRevision(player);
             List<TransitionJournal.Change> completed = withAfter(changes, currentPayloads);
             TransitionJournal.complete(journal, "committed", completed, null);
-            snapshotWriter.commitImmediately(
-                    player.getUUID(), revision, writes, Optional.of(journal),
+            journal.put("restore_context", restoreContext(world, targetKeys));
+            if (escrow == null) snapshotWriter.commitImmediately(
+                    player.getUUID(), revision, writes, Optional.of(journal), archives.stream().map(ArchiveRequest::toStoreArchive).toList());
+            else snapshotWriter.commitEscrow(player.getUUID(), revision, writes, escrow.mutation(), journal,
                     archives.stream().map(ArchiveRequest::toStoreArchive).toList());
             sessions.put(player.getUUID(), new Session(
                     player, player.serverLevel().dimension(), world, gameMode, targetKeys, activeAdapters,
@@ -1769,7 +1826,7 @@ public final class InventoryIsolationService implements AutoCloseable {
                     failure.addSuppressed(rollbackFailure);
                     recordQuarantine(player.getUUID());
                 }
-                if (journal != null) {
+                if (journal != null && revision > 0) {
                     try {
                         TransitionJournal.complete(journal, "rolled_back", changes, failure.toString());
                         store.writeRevision(player.getUUID(), revision, journal);
@@ -1780,6 +1837,73 @@ public final class InventoryIsolationService implements AutoCloseable {
             }
             throw transitionFailure("Unable to initialize player profile", failure);
         }
+    }
+
+    private void verifyLoginApplication(ServerPlayer player, Map<String, SharableAdapter> adapters,
+            Map<String, CompoundTag> expected, Map<String, CompoundTag> actual,
+            Map<String, ProfileKey> keys, Map<ProfileKey, CompoundTag> writes, List<ArchiveRequest> archives) throws IOException {
+        for (var entry : expected.entrySet()) {
+            SharableAdapter adapter = adapters.get(entry.getKey());
+            var result = adapter.verifyRestored(player, entry.getValue(), actual.get(entry.getKey()), player.registryAccess());
+            if (!result.accepted()) throw new IOException("Application verification " + entry.getKey() + " "
+                    + result.status() + ": " + result.detail());
+            if (result.status() != dev.yu.mwi.api.RestoreVerification.Status.SEMANTIC_EQUIVALENT) continue;
+            CompoundTag normalized = result.after();
+            replace(player, List.of(adapter), () -> { adapter.clear(player); adapter.apply(player, normalized, player.registryAccess()); });
+            CompoundTag second = adapter.capture(player, player.registryAccess());
+            if (!normalized.equals(second)) throw new IOException("Unstable adapter normalization: " + entry.getKey());
+            CompoundTag evidence = new CompoundTag(); evidence.putString("rule", result.rule());
+            evidence.putString("expected_digest", dev.yu.mwi.storage.NbtChecksums.canonicalSha256(entry.getValue()));
+            evidence.putString("actual_digest", dev.yu.mwi.storage.NbtChecksums.canonicalSha256(second));
+            evidence.put("verified_after", second.copy());
+            ProfileKey key = keys.get(entry.getKey());
+            if (snapshotWriter.load(key).isPresent()) archives.add(new ArchiveRequest(key,
+                    "semantic-normalization", "verified stable adapter after-image", evidence));
+            writes.put(key, second);
+            actual.put(entry.getKey(), second);
+        }
+        // An equipment round trip may affect another share. Verify the complete dependency set again.
+        for (var entry : expected.entrySet()) {
+            SharableAdapter adapter = adapters.get(entry.getKey());
+            CompoundTag captured = adapter.capture(player, player.registryAccess());
+            var result = adapter.verifyRestored(player, entry.getValue(), captured, player.registryAccess());
+            if (!result.accepted() || !captured.equals(actual.get(entry.getKey())))
+                throw new IOException("Adapter dependency changed during verification: " + entry.getKey());
+        }
+    }
+
+    private record ActivationEscrow(String share, dev.yu.mwi.storage.RecoveryMutation mutation) {}
+    private ActivationEscrow prepareActivationEscrow(ServerPlayer player, Map<String, SharableAdapter> adapters,
+            Map<String, CompoundTag> expected, Map<String, ProfileKey> keys) throws IOException {
+        ActivationEscrow result = null;
+        for (var entry : expected.entrySet()) {
+            var plan = adapters.get(entry.getKey()).prepareRecoveryEscrow(player, entry.getValue(), player.registryAccess());
+            if (plan.isEmpty()) continue;
+            if (result != null) throw new IOException("Multiple adapter escrow plans require explicit dependency review");
+            var contents = plan.orElseThrow();
+            String digest = dev.yu.mwi.storage.NbtChecksums.canonicalSha256(contents.original());
+            UUID source = UUID.nameUUIDFromBytes((keys.get(entry.getKey()) + ":activation-escrow:" + digest)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            if (store.loadRecovery(player.getUUID(), source).isPresent())
+                throw new IOException("This equipment source already has a permanent escrow receipt; refusing to issue it again");
+            CompoundTag evidence = new CompoundTag(); evidence.putString("type", "activation_escrow");
+            evidence.putString("provider", "yu_multiverse_inventory"); evidence.putString("adapter", entry.getKey());
+            evidence.putString("source_digest", digest); evidence.put("original_slots", contents.original());
+            CompoundTag identity = new CompoundTag(); identity.put("scope", recoveryScope(keys));
+            identity.put("evidence", evidence); identity.put("original_items", contents.items());
+            CompoundTag payload = new CompoundTag(); payload.put("identity", identity); payload.put("remaining", contents.items());
+            payload.putString("state", "AVAILABLE"); payload.putBoolean("notify_ready", true);
+            payload.putLong("created_at", System.currentTimeMillis());
+            result = new ActivationEscrow(entry.getKey(), new dev.yu.mwi.storage.RecoveryMutation(source, -1, source, payload));
+        }
+        return result;
+    }
+
+    private static CompoundTag restoreContext(WorldIdentity world, Map<String, ProfileKey> keys) {
+        CompoundTag context = new CompoundTag(); context.putString("world", world.name());
+        net.minecraft.nbt.ListTag encoded = new net.minecraft.nbt.ListTag();
+        keys.values().forEach(key -> encoded.add(TransitionJournal.encodeKey(key)));
+        context.put("keys", encoded); return context;
     }
 
     private void resetInterruptedTargets(
@@ -1981,6 +2105,7 @@ public final class InventoryIsolationService implements AutoCloseable {
 
             List<TransitionJournal.Change> completed = LiveStateCoordinator.withAfter(changes, after);
             TransitionJournal.complete(journal, "committed", completed, null);
+            journal.put("restore_context", restoreContext(finalWorld, finalKeys));
             snapshotWriter.enqueue(
                     player.getUUID(),
                     revision,
@@ -2068,6 +2193,8 @@ public final class InventoryIsolationService implements AutoCloseable {
                     key.shareId(), payload, player.registryAccess(),
                     state.config().model().itemMigration());
             ItemCompatibilityReport report = preparation.report();
+            if (isRecoveryHeld(player) && (report.missingItems() > 0 || report.missingComponents() > 0))
+                throw new IllegalStateException("恢复依赖的物品或组件注册项缺失；原档案保留，等待环境修复或管理员显式处理");
             payload = preparation.payload();
             if (report.changed()) {
                 ArchiveRequest archive = new ArchiveRequest(
@@ -2291,7 +2418,14 @@ public final class InventoryIsolationService implements AutoCloseable {
         requireServerThread();
         RecoveryHold existing = recoveryHolds.get(player.getUUID());
         if (existing != null && existing.owner == player) return;
+        if (existing != null) {
+            existing.disconnected = true;
+            retiredRecoveryPlayers.add(existing.owner);
+            if (existing.completion != null) existing.completion.completeExceptionally(new IOException("连接已更换；旧连接不再拥有恢复任务"));
+        }
         recoveryHolds.put(player.getUUID(), new RecoveryHold(player, snapshotWriter.fence(player.getUUID())));
+        var command = restoreCommands.get(player.getUUID());
+        if (command != null && !command.completion().isDone()) recoveryHolds.get(player.getUUID()).commandPreparing = true;
     }
 
     public boolean isRecoveryHeld(ServerPlayer player) {
@@ -2300,6 +2434,9 @@ public final class InventoryIsolationService implements AutoCloseable {
     }
 
     public boolean isRecoveryInternal() { return recoveryInternal.get(); }
+    public boolean isRecoveryCheckpoint(ServerPlayer player) {
+        return recoveryInternal.get() && recoveryCheckpoints.contains(player.getUUID());
+    }
 
     public void captureLoadedPlayer(ServerPlayer player, CompoundTag loaded) {
         RecoveryHold hold = recoveryHolds.get(player.getUUID());
@@ -2320,6 +2457,9 @@ public final class InventoryIsolationService implements AutoCloseable {
             try {
                 closeMenu(player);
                 hold.mode = player.gameMode.getGameModeForPlayer();
+                hold.returnDimension = player.serverLevel().dimension();
+                hold.returnPosition = player.position();
+                hold.returnYaw = player.getYRot(); hold.returnPitch = player.getXRot();
                 hold.captured = capture(player, activeAdapters(player, state).values());
                 hold.detached = new CompoundTag();
                 hold.captured.forEach((adapter, tag) -> hold.detached.put(adapter.id().toString(), tag.copy()));
@@ -2334,14 +2474,20 @@ public final class InventoryIsolationService implements AutoCloseable {
     }
 
     private void requestAutomaticRecovery(RecoveryHold hold) {
-        if (stopping || hold.running || hold.captured == null) return;
+        if (stopping || hold.running || hold.captured == null || hold.commandPreparing) return;
         hold.running = true;
         UUID owner = hold.owner.getUUID(), incident = hold.incident;
         long fence = hold.fence;
         CompoundTag detached = hold.detached.copy();
         boolean repair = state.config().storage().automaticRecovery() || hold.manualRetry;
+        boolean manual = hold.manualRetry;
         hold.manualRetry = false;
-        recoveryExecutor.submit(owner, incident, () -> snapshotWriter.recover(owner, fence, incident, detached, repair))
+        if (hold.completion == null || hold.completion.isDone()) hold.completion = new java.util.concurrent.CompletableFuture<>();
+        recoveryExecutor.submit(owner, incident, () -> {
+                    var inspected = snapshotWriter.recover(owner, fence, incident, detached, repair);
+                    hold.request = store.restoreRequest(owner);
+                    return inspected;
+                })
                 .whenComplete((inspection, failure) -> server.execute(() -> {
                     hold.running = false;
                     if (stopping || recoveryHolds.get(owner) != hold || hold.disconnected) return;
@@ -2349,14 +2495,17 @@ public final class InventoryIsolationService implements AutoCloseable {
                     hold.retryAt = nextRecoveryTime();
                     if (failure != null) {
                         logger.warn("Automatic inventory recovery remains pending for {}", owner, failure);
+                        hold.completion.completeExceptionally(failure);
                         return;
                     }
                     hold.inspection = inspection;
                     if (!inspection.ready(hold.required)) {
                         displayRecoveryHold(hold);
+                        hold.completion.complete(inspection);
                         return;
                     }
-                    activateRecovered(hold, inspection);
+                    activateRecovered(hold, inspection, manual);
+                    hold.completion.complete(inspection);
                 }));
     }
 
@@ -2366,7 +2515,7 @@ public final class InventoryIsolationService implements AutoCloseable {
         int submitted = 0;
         for (UUID owner : List.copyOf(backgroundRecoveryAt.keySet())) {
             RecoveryHold hold = recoveryHolds.get(owner);
-            if (sessions.containsKey(owner) || (hold != null && !hold.disconnected)
+            if (sessions.containsKey(owner) || (hold != null && !hold.disconnected) || restoreCommands.containsKey(owner)
                     || backgroundRecoveryRunning.contains(owner) || backgroundRecoveryAt.get(owner) > System.nanoTime()) continue;
             if (++submitted > 4) break;
             backgroundRecoveryRunning.add(owner);
@@ -2397,16 +2546,41 @@ public final class InventoryIsolationService implements AutoCloseable {
             List<SharableAdapter> items = hold.captured.keySet().stream()
                     .filter(adapter -> ItemProfileCompatibility.supports(adapter.id().getPath())).toList();
             replace(hold.owner, items, () -> items.forEach(adapter -> adapter.clear(hold.owner)));
-            hold.owner.setGameMode(net.minecraft.world.level.GameType.SPECTATOR);
+            var lobbyKey = net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.DIMENSION,
+                    net.minecraft.resources.ResourceLocation.fromNamespaceAndPath("yu_multiverse_inventory", "recovery_lobby"));
+            var lobby = server.getLevel(lobbyKey);
+            if (lobby != null) hold.owner.teleportTo(lobby, 0.5, -59, 0.5, 0, 0);
+            hold.owner.setGameMode(net.minecraft.world.level.GameType.ADVENTURE);
             hold.displayed = true;
-            hold.owner.sendSystemMessage(Component.literal("背包正在恢复，暂时无法取回；恢复成功后会自动继续。"));
+            hold.owner.sendSystemMessage(Component.literal("[背包恢复] ").withStyle(net.minecraft.ChatFormatting.AQUA)
+                    .append(Component.literal(lobby != null ? "原档案已保留。你可以在恢复大厅移动；"
+                            : "原档案已保留。恢复空间尚未加载，当前仍处于受保护会话；").withStyle(net.minecraft.ChatFormatting.GOLD))
+                    .append(Component.literal("[查看进度与帮助]").withStyle(style -> style.withColor(net.minecraft.ChatFormatting.AQUA)
+                            .withClickEvent(new net.minecraft.network.chat.ClickEvent(net.minecraft.network.chat.ClickEvent.Action.RUN_COMMAND, "/mwistatus")))));
         } finally { recoveryInternal.remove(); }
     }
 
-    private void activateRecovered(RecoveryHold hold, dev.yu.mwi.storage.RecoveryInspection inspection) {
+    private void activateRecovered(RecoveryHold hold, dev.yu.mwi.storage.RecoveryInspection inspection, boolean manual) {
         recoveryInternal.set(true);
         try {
             if (inspection.generation() != store.recoveryGeneration(hold.owner.getUUID())) return;
+            CompoundTag input = new CompoundTag();
+            hold.required.stream().sorted(java.util.Comparator.comparing(Object::toString)).forEach(key -> {
+                var stored = inspection.profiles().get(key);
+                if (stored != null) input.put(key.toString(), stored.payload());
+            });
+            input.putString("rule", dev.yu.mwi.adapter.vanilla.ItemStackSemantics.RULE);
+            if ("PREPARED".equals(hold.request.getString("state"))) input.put("requested_restore", hold.request);
+            input.putString("environment", net.neoforged.fml.ModList.get().getMods().stream()
+                    .map(mod -> mod.getModId() + "=" + mod.getVersion()).sorted().collect(java.util.stream.Collectors.joining(";")));
+            hold.activation = dev.yu.mwi.storage.ActivationAttempt.prepare(store.activationTask(hold.owner.getUUID()),
+                    dev.yu.mwi.storage.NbtChecksums.canonicalSha256(input), manual);
+            store.saveActivationTask(hold.owner.getUUID(), hold.activation);
+            if ("ACTION_REQUIRED".equals(hold.activation.getString("state"))) { displayRecoveryHold(hold); return; }
+            var returnLevel = server.getLevel(hold.returnDimension);
+            if (returnLevel == null) throw new IOException("Original recovery dimension is unavailable");
+            if (hold.displayed) hold.owner.teleportTo(returnLevel, hold.returnPosition.x, hold.returnPosition.y,
+                    hold.returnPosition.z, hold.returnYaw, hold.returnPitch);
             hold.owner.setGameMode(hold.mode);
             rollback(hold.owner, hold.captured);
             snapshotWriter.installRecovered(hold.owner.getUUID(), hold.fence, inspection);
@@ -2416,11 +2590,25 @@ public final class InventoryIsolationService implements AutoCloseable {
             // Activation remains fenced until every persisted adapter has been applied and synced.
             for (var entry : session.activeAdapters().entrySet()) {
                 var stored = snapshotWriter.load(session.profiles().get(entry.getKey()));
-                if (stored.isPresent() && !entry.getValue().equivalent(stored.orElseThrow().payload(),
-                        entry.getValue().capture(hold.owner, hold.owner.registryAccess())))
+                if (stored.isPresent() && !entry.getValue().verifyRestored(hold.owner, stored.orElseThrow().payload(),
+                        entry.getValue().capture(hold.owner, hold.owner.registryAccess()), hold.owner.registryAccess()).accepted())
                     throw new IOException("Adapter verification failed during recovery activation: " + entry.getKey());
             }
+            hold.activation.putString("state", "CHECKPOINT");
+            store.saveActivationTask(hold.owner.getUUID(), hold.activation);
+            recoveryCheckpoints.add(hold.owner.getUUID());
+            try { dev.yu.mwi.recovery.RecoveryCheckpoint.save(hold.owner, hold.activation.getUUID("operation_id")); }
+            finally { recoveryCheckpoints.remove(hold.owner.getUUID()); }
+            hold.activation.putString("state", "ACTIVE");
+            hold.activation.putInt("attempts", 0);
+            store.saveActivationTask(hold.owner.getUUID(), hold.activation);
+            CompoundTag request = store.restoreRequest(hold.owner.getUUID());
+            if ("COMMITTED".equals(request.getString("state"))) {
+                request.putString("state", "ACTIVE"); store.saveRestoreRequest(hold.owner.getUUID(), request);
+                hold.request = request;
+            }
             recoveryHolds.remove(hold.owner.getUUID(), hold);
+            dev.yu.mwi.recovery.RecoveryNotifications.enqueue(hold.owner);
             if (!inspection.unavailable().isEmpty()) backgroundRecoveryAt.put(hold.owner.getUUID(),
                     nextRecoveryTime());
             if (hold.displayed) hold.owner.sendSystemMessage(Component.literal("背包已恢复，可以继续游戏。"));
@@ -2429,7 +2617,12 @@ public final class InventoryIsolationService implements AutoCloseable {
             recordQuarantine(hold.owner.getUUID());
             hold.fence = snapshotWriter.fence(hold.owner.getUUID());
             hold.displayed = false;
-            logger.error("Recovery activation remains fenced for {}", hold.owner.getUUID(), failure);
+            Throwable reason = failure;
+            while (reason.getCause() != null && reason.getCause() != reason) reason = reason.getCause();
+            hold.activation = dev.yu.mwi.storage.ActivationAttempt.failed(hold.activation, meaningfulMessage(reason));
+            try { store.saveActivationTask(hold.owner.getUUID(), hold.activation); }
+            catch (IOException evidenceFailure) { failure.addSuppressed(evidenceFailure); }
+            logger.error("Recovery activation {} for {}: {}", hold.activation.getString("state"), hold.owner.getUUID(), failure.toString());
             displayRecoveryHold(hold);
         } finally { recoveryInternal.remove(); }
     }
@@ -2438,9 +2631,156 @@ public final class InventoryIsolationService implements AutoCloseable {
         RecoveryHold hold = recoveryHolds.get(player.getUUID());
         if (hold.captured == null || hold.disconnected) return;
         closeMenu(player);
-        player.setDeltaMovement(net.minecraft.world.phys.Vec3.ZERO);
         player.fallDistance = 0;
         if (!hold.running && System.nanoTime() >= hold.retryAt && state.config().storage().automaticRecovery()) requestAutomaticRecovery(hold);
+    }
+
+    public java.time.ZoneId restoreTimeZone() { return java.time.ZoneId.of(state.config().storage().restoreTimeZone()); }
+
+    public String recoveryStatus(UUID owner) {
+        RecoveryHold hold = recoveryHolds.get(owner);
+        if (hold != null) {
+            String backend = hold.inspection == null ? "VERIFY_SOURCE" : hold.inspection.state();
+            String activation = hold.activation.getString("state");
+            if (activation.isEmpty()) activation = "WAITING_FOR_SOURCE";
+            return "存储=" + backend + "，玩家激活=" + activation + "，尝试=" + hold.activation.getInt("attempts")
+                    + "/3。" + hold.activation.getString("last_error") + " 原档案保留；管理员可按玩家名查看恢复点。";
+        }
+        return sessions.containsKey(owner) ? "玩家激活=ACTIVE，正常会话已可用。" : "玩家离线；应用和保存将在登录时核验。";
+    }
+
+    public java.util.concurrent.CompletableFuture<List<String>> describeRestore(UUID owner, boolean statusOnly) {
+        requireServerThread();
+        RecoveryHold hold = recoveryHolds.get(owner); Session session = sessions.get(owner);
+        Set<ProfileKey> known = hold != null && hold.required != null ? hold.required
+                : session == null ? Set.of() : Set.copyOf(session.profiles().values());
+        String onlineStatus = recoveryStatus(owner); java.time.ZoneId zone = restoreTimeZone();
+        return recoveryExecutor.detached(() -> {
+            List<String> lines = new ArrayList<>(); lines.add(onlineStatus);
+            CompoundTag request = store.restoreRequest(owner), activation = store.activationTask(owner);
+            if (request.hasUUID("operation_id")) lines.add("恢复任务=" + request.getUUID("operation_id") + " 状态=" + request.getString("state"));
+            if (!activation.isEmpty()) lines.add("持久化激活状态=" + activation.getString("state") + "，尝试=" + activation.getInt("attempts"));
+            if (statusOnly) return List.copyOf(lines);
+            Set<ProfileKey> required = known;
+            if (required.isEmpty()) {
+                try { required = RestorePlans.keys(store.restoreContext(owner), owner); }
+                catch (IOException unknown) { lines.add(unknown.getMessage()); }
+            }
+            List<dev.yu.mwi.storage.RestorePoint> points = store.restorePoints(owner);
+            lines.add("恢复记录时区：" + zone + "（每行显示 UTC 偏移）");
+            for (var point : points.stream().limit(100).toList()) {
+                String scopes = point.profiles().keySet().stream().map(key -> key.scope().id()).distinct().sorted()
+                        .collect(java.util.stream.Collectors.joining("/"));
+                String shares = point.profiles().keySet().stream().map(ProfileKey::shareId).distinct().sorted()
+                        .collect(java.util.stream.Collectors.joining(","));
+                String missing = required.stream().filter(key -> !point.profiles().containsKey(key))
+                        .map(key -> key.shareId() + "@" + key.scope().id()).sorted()
+                        .collect(java.util.stream.Collectors.joining(","));
+                CompoundTag summary = new CompoundTag();
+                for (var profile : point.profiles().entrySet()) summary.putString(profile.getKey().toString(),
+                        dev.yu.mwi.storage.NbtChecksums.canonicalSha256(profile.getValue().payload()));
+                lines.add(RestorePointSelector.label(point, zone, points) + " " + point.committedAt().atZone(zone).getOffset()
+                        + " " + scopes + " [" + shares + "] " + (point.completeFor(required) ? "可恢复" : "部分数据/范围待核验")
+                        + " 来源=" + point.source() + " 摘要=" + dev.yu.mwi.storage.NbtChecksums.canonicalSha256(summary).substring(0,16)
+                        + (missing.isEmpty() ? "" : " 缺少=" + missing)
+                        + (point.problems().isEmpty() ? "" : " " + String.join(";", point.problems())));
+            }
+            if (points.isEmpty()) lines.add("没有可验证的已提交恢复点。原始档案不会被空数据替代。");
+            return List.copyOf(lines);
+        });
+    }
+
+    public RestoreCommandTask requestRestore(UUID owner, String selector, String operator) {
+        requireServerThread();
+        if (!"latest".equals(selector) && !selector.matches("#[0-9]+")
+                && !selector.matches("[0-9]{8}(-[0-9]{6}(\\.[0-9]{3})?)?"))
+            throw new IllegalArgumentException("恢复目标应为 latest 或 list 中的时间 YYYYMMDD-HHmmss[.SSS]");
+        RestoreCommandTask existing = restoreCommands.get(owner);
+        if (existing != null && !existing.completion().isDone()) {
+            if (!existing.selector().equals(selector)) throw new IllegalArgumentException("该玩家已有不同目标的恢复任务，请先查询状态");
+            return existing;
+        }
+        RestoreCommandTask task = new RestoreCommandTask(UUID.randomUUID(), selector, new java.util.concurrent.CompletableFuture<>());
+        restoreCommands.put(owner, task);
+        task.completion().whenComplete((message, failure) -> server.execute(() -> {
+            if (restoreCommands.remove(owner, task)) {
+                RecoveryHold current = recoveryHolds.get(owner);
+                if (current != null && current.commandPreparing) {
+                    current.commandPreparing = false;
+                    requestAutomaticRecovery(current);
+                }
+            }
+        }));
+        if ("latest".equals(selector)) {
+            try {
+                CompoundTag pending = store.restoreRequest(owner);
+                if ("PREPARED".equals(pending.getString("state")))
+                    throw new IOException("已有历史恢复任务 " + pending.getString("selector")
+                            + " 待执行；latest 不会替换或代为执行。请查询 status 或继续原目标。");
+                ServerPlayer player = server.getPlayerList().getPlayer(owner);
+                if (player != null && !isRecoveryHeld(player)) checkpointImmediately(player, "administrator_latest_current_backup");
+                inspectAutomaticRecovery(owner, true).whenComplete((inspection, failure) -> server.execute(() -> {
+                    if (failure != null) task.completion().completeExceptionally(failure);
+                    else if (player != null) {
+                        Session session = sessions.get(owner);
+                        if (session != null && !inspection.ready(Set.copyOf(session.profiles().values())))
+                            task.completion().complete("WAITING_FOR_SOURCE：当前存储核验未通过，未执行历史回滚。" + recoveryStatus(owner));
+                        else task.completion().complete(recoveryStatus(owner));
+                    }
+                    else if (inspection != null && inspection.unavailable().isEmpty() && inspection.pending().isEmpty())
+                        task.completion().complete("已核验当前权威状态；玩家离线，待下次登录完成应用、验证与保存。");
+                    else task.completion().complete("WAITING_FOR_SOURCE：当前可靠来源不足，没有回滚到更旧背包。");
+                }));
+            } catch (Exception failure) { task.completion().completeExceptionally(failure); }
+        } else prepareHistoricalRestore(owner, selector, operator, task);
+        return task;
+    }
+
+    private void prepareHistoricalRestore(UUID owner, String selector, String operator, RestoreCommandTask task) {
+        RecoveryHold existing = recoveryHolds.get(owner);
+        if (existing != null && existing.running && existing.completion != null) {
+            existing.completion.whenComplete((ignored, failure) -> server.execute(() -> prepareHistoricalRestore(owner, selector, operator, task)));
+            return;
+        }
+        try {
+            ServerPlayer player = server.getPlayerList().getPlayer(owner);
+            if (player != null && !isRecoveryHeld(player)) checkpointImmediately(player, "before_administrator_historical_restore");
+            if (player != null) { prepareLogin(player); recoveryHolds.get(owner).commandPreparing = true; beginRecoveryHold(player); }
+            RecoveryHold held = recoveryHolds.get(owner);
+            Set<ProfileKey> keys = held == null ? Set.of() : held.required;
+            long fence = held == null ? snapshotWriter.fence(owner) : held.fence;
+            UUID incident = held == null ? null : held.incident;
+            CompoundTag detached = held == null ? null : held.detached.copy();
+            java.time.ZoneId zone = restoreTimeZone(); long configGeneration = state.generation();
+            recoveryExecutor.detached(() -> {
+                var inspection = snapshotWriter.recover(owner, fence, incident, detached, true);
+                Set<ProfileKey> required = keys.isEmpty() ? RestorePlans.keys(store.restoreContext(owner), owner) : keys;
+                return RestorePlans.prepare(store, owner, selector, required, inspection, zone, operator);
+            }).whenComplete((request, failure) -> server.execute(() -> {
+                RecoveryHold current = recoveryHolds.get(owner);
+                if (current != null) current.commandPreparing = false;
+                if (stopping || state.generation() != configGeneration) {
+                    task.completion().completeExceptionally(new IOException("服务或共享配置已变化，恢复任务保留待核验")); return;
+                }
+                if (failure != null) {
+                    task.completion().completeExceptionally(failure);
+                    if (current != null && !current.disconnected) requestAutomaticRecovery(current);
+                    return;
+                }
+                if ("ACTIVE".equals(request.getString("state"))) {
+                    task.completion().complete("同一恢复点已完成，未重复回档或发放物品。");
+                    if (current != null) requestAutomaticRecovery(current);
+                } else if (current == null || current.disconnected) {
+                    task.completion().complete("已准备恢复点 " + selector + "；玩家离线，将在下次登录完成应用校验和保存。操作=" + request.getUUID("operation_id"));
+                } else {
+                    requestAutomaticRecovery(current);
+                    current.completion.whenComplete((ignored, activationFailure) -> server.execute(() -> {
+                        if (activationFailure != null) task.completion().completeExceptionally(activationFailure);
+                        else task.completion().complete(recoveryStatus(owner));
+                    }));
+                }
+            }));
+        } catch (Exception failure) { task.completion().completeExceptionally(failure); }
     }
 
     public java.util.concurrent.CompletableFuture<dev.yu.mwi.storage.RecoveryInspection> inspectAutomaticRecovery(
@@ -2448,10 +2788,12 @@ public final class InventoryIsolationService implements AutoCloseable {
         requireServerThread();
         RecoveryHold hold = recoveryHolds.get(owner);
         if (hold != null && !hold.disconnected && repair) {
+            if (hold.commandPreparing) return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IOException("管理员恢复任务正在准备，请查询现有任务状态"));
             hold.retryAt = 0;
             hold.manualRetry = true;
             requestAutomaticRecovery(hold);
-            return java.util.concurrent.CompletableFuture.completedFuture(hold.inspection);
+            return hold.completion;
         }
         if (sessions.containsKey(owner)) return snapshotWriter.inspectInQueue(owner, repair);
         if (!repair) return recoveryExecutor.submit(owner, "inspect-only", () -> store.inspectRecovery(owner, false));
@@ -2496,8 +2838,14 @@ public final class InventoryIsolationService implements AutoCloseable {
         CompoundTag loadedPlayer;
         Set<ProfileKey> required;
         net.minecraft.world.level.GameType mode;
+        ResourceKey<Level> returnDimension;
+        net.minecraft.world.phys.Vec3 returnPosition;
+        float returnYaw, returnPitch;
         dev.yu.mwi.storage.RecoveryInspection inspection;
-        boolean running, displayed, disconnected, manualRetry;
+        CompoundTag activation = new CompoundTag();
+        CompoundTag request = new CompoundTag();
+        java.util.concurrent.CompletableFuture<dev.yu.mwi.storage.RecoveryInspection> completion;
+        boolean running, displayed, disconnected, manualRetry, commandPreparing;
         long retryAt;
         RecoveryHold(ServerPlayer owner, long fence) { this.owner = owner; this.fence = fence; }
     }

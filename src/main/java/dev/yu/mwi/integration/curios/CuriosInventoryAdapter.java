@@ -33,6 +33,54 @@ public final class CuriosInventoryAdapter implements SharableAdapter, ItemEditSl
     }
 
     @Override
+    public dev.yu.mwi.api.RestoreVerification verifyRestored(ServerPlayer player, CompoundTag expected,
+            CompoundTag actual, HolderLookup.Provider lookup) {
+        return dev.yu.mwi.adapter.vanilla.ItemPayloadVerification.verify(expected, actual, lookup, true);
+    }
+
+    /** Preflight only: never apply an unavailable slot and let Curios drop its invalid stacks. */
+    @Override
+    public java.util.Optional<dev.yu.mwi.api.RecoveryEscrow> prepareRecoveryEscrow(ServerPlayer player, CompoundTag expected,
+            HolderLookup.Provider lookup) {
+        if (!net.neoforged.fml.ModList.get().getModContainerById("curios")
+                .map(mod -> java.util.Set.of("9.5.1", "9.5.1+1.21.1").contains(mod.getModInfo().getVersion().toString())).orElse(false))
+            return java.util.Optional.empty();
+        if (expected.getInt(SCHEMA) != SCHEMA_VERSION || !(expected.get(CAPABILITY) instanceof CompoundTag capability))
+            return java.util.Optional.empty();
+        ListTag slots = requireCompoundList(capability, "Curios");
+        boolean unavailable = false; Set<String> identifiers = new HashSet<>(); ListTag items = new ListTag();
+        for (Tag tag : slots) {
+            CompoundTag entry = (CompoundTag) tag; String identifier = entry.getString("Identifier");
+            if (identifier.isBlank() || !identifiers.add(identifier)) throw invalid("invalid escrow slot identity");
+            unavailable |= handler(player).getStacksHandler(identifier).isEmpty();
+            if (!(entry.get("StacksHandler") instanceof CompoundTag stacks)) throw invalid("invalid escrow handler");
+            for (String kind : java.util.List.of("Stacks", "Cosmetics")) {
+                if (!stacks.contains(kind)) continue;
+                CompoundTag inventory = stacks.getCompound(kind);
+                if (!inventory.contains("Size", Tag.TAG_INT) || inventory.getInt("Size") < 0 || inventory.getInt("Size") > 1024)
+                    throw invalid("invalid escrow capacity");
+                Set<Integer> occupied = new HashSet<>();
+                for (Tag value : requireCompoundList(inventory, "Items")) {
+                    CompoundTag encoded = ((CompoundTag) value).copy(); int index = encoded.getInt("Slot");
+                    if (!encoded.contains("Slot", Tag.TAG_INT) || index < 0 || index >= inventory.getInt("Size") || !occupied.add(index))
+                        throw invalid("invalid escrow item slot");
+                    encoded.remove("Slot");
+                    ItemStack decoded = dev.yu.mwi.adapter.vanilla.ItemStackSemantics.decode(encoded, lookup);
+                    CompoundTag normalized = (CompoundTag) decoded.save(lookup);
+                    if (!dev.yu.mwi.adapter.vanilla.ItemStackSemantics.verify(encoded, normalized, lookup).accepted())
+                        throw invalid("escrow item does not round-trip losslessly");
+                    items.add(normalized);
+                }
+            }
+        }
+        if (!unavailable) return java.util.Optional.empty();
+        if (items.isEmpty()) throw invalid("unavailable slot metadata requires review; no transferable item set");
+        try { dev.yu.mwi.recovery.RecoveryItems.decode(items, lookup); }
+        catch (java.io.IOException invalid) { throw new IllegalArgumentException("Escrow items are not stable", invalid); }
+        return java.util.Optional.of(new dev.yu.mwi.api.RecoveryEscrow(items, expected));
+    }
+
+    @Override
     public boolean available(ServerPlayer player) {
         return CuriosApi.getCuriosInventory(player).isPresent();
     }
@@ -188,6 +236,15 @@ public final class CuriosInventoryAdapter implements SharableAdapter, ItemEditSl
         }
         if (decoded.getSlots() < 0 || decoded.getSlots() > 1024) {
             throw invalid("Curios " + identifier + ' ' + key + " has unreasonable size " + decoded.getSlots());
+        }
+        Set<Integer> occupied = new HashSet<>();
+        for (Tag tag : requireCompoundList(inventory, "Items")) {
+            CompoundTag encoded = (CompoundTag) tag;
+            int slot = encoded.getInt("Slot");
+            if (!encoded.contains("Slot", Tag.TAG_INT) || slot < 0 || slot >= decoded.getSlots() || !occupied.add(slot))
+                throw invalid("invalid or duplicate Curios slot");
+            CompoundTag item = encoded.copy(); item.remove("Slot");
+            dev.yu.mwi.adapter.vanilla.ItemStackSemantics.decode(item, lookup);
         }
     }
 

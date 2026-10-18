@@ -175,12 +175,12 @@ public final class ConfigManager {
         UnmodifiableConfig storageTable = table(root, "storage", Config.inMemory());
         rejectUnknownKeys(storageTable, "storage", Set.of(
                 "_documentation", "max_revisions", "cache_entries", "cache_megabytes",
-                "io_concurrency", "queue_capacity", "flush_timeout_seconds", "automatic_recovery", "recovery_retry_seconds"));
+                "io_concurrency", "queue_capacity", "flush_timeout_seconds", "automatic_recovery", "recovery_retry_seconds", "restore_time_zone"));
         RuntimeConfig.Storage storage = new RuntimeConfig.Storage(integer(storageTable, "max_revisions", 20),
                 integer(storageTable, "cache_entries", 1_024), integer(storageTable, "cache_megabytes", 128),
                 integer(storageTable, "io_concurrency", 2), integer(storageTable, "queue_capacity", 256),
                 integer(storageTable, "flush_timeout_seconds", 30), bool(storageTable, "automatic_recovery", true),
-                integer(storageTable, "recovery_retry_seconds", 30));
+                integer(storageTable, "recovery_retry_seconds", 30), string(storageTable, "restore_time_zone", "Asia/Shanghai"));
         UnmodifiableConfig compatibility = table(root, "mvinv_compat", Config.inMemory());
         rejectUnknownKeys(compatibility, "mvinv_compat", Set.of("_documentation", "mode", "data_directory"));
 
@@ -281,6 +281,7 @@ public final class ConfigManager {
         storage.set("automatic_recovery", runtime.storage().automaticRecovery());
         storage.setComment("automatic_recovery", "自动复核与无损恢复；关闭时仍保留恢复会话和写入保护。");
         storage.set("recovery_retry_seconds", runtime.storage().recoveryRetrySeconds());
+        storage.set("restore_time_zone", runtime.storage().restoreTimeZone());
         CommentedConfig compatibility = section(root, "mvinv_compat", "Multiverse-Inventories 兼容模式。");
         compatibility.set("mode", runtime.mvinvMode().name().toLowerCase(Locale.ROOT));
         compatibility.set("data_directory", runtime.mvinvDataDirectory());

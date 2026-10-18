@@ -49,6 +49,7 @@ public final class RecoveryCenter {
         String type = evidence.getString("type");
         if ("grave_claim".equals(type)) return "普通墓碑物品请通过墓碑领取";
         String provider = evidence.getString("provider");
+        if ("yu_multiverse_inventory".equals(provider) && "activation_escrow".equals(type)) return "";
         // Earlier candidates had no provider field. They must not bypass the live grave check.
         if (provider.isEmpty() && ("death_escrow".equals(type) || evidence.hasUUID("death_id"))) provider = "tombstonedefender";
         if (provider.isEmpty()) return "";
