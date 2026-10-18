@@ -39,7 +39,9 @@ public interface SharableAdapter {
 
     default RestoreVerification verifyRestored(ServerPlayer player, CompoundTag expected,
             CompoundTag actual, HolderLookup.Provider registries) {
-        return RestoreVerification.strict(equivalent(expected, actual), actual);
+        boolean equal = equivalent(expected, actual);
+        return new RestoreVerification(equal ? RestoreVerification.Status.EXACT : RestoreVerification.Status.DIFFERENT,
+                "strict-nbt-v1", equal ? "" : NbtDifference.first(expected, actual), equal ? actual : null);
     }
 
     default java.util.Optional<RecoveryEscrow> prepareRecoveryEscrow(ServerPlayer player, CompoundTag expected,
@@ -48,6 +50,12 @@ public interface SharableAdapter {
     void clear(ServerPlayer player);
 
     void apply(ServerPlayer player, CompoundTag data, HolderLookup.Provider lookup);
+
+    /** Reconcile scalar dependencies after equipment and effects have all been installed. */
+    default void dependenciesApplied(ServerPlayer player) {}
+
+    /** Reject unresolved live side channels before a recovery can establish canonical ownership. */
+    default void validateRestoreEnvironment(ServerPlayer player) {}
 
     void sync(ServerPlayer player);
 

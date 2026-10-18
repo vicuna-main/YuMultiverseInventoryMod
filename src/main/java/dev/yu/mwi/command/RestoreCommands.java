@@ -38,7 +38,11 @@ public final class RestoreCommands {
     private static int run(CommandSourceStack source, MwiServerController controller, String name, String selector) {
         try {
             var service=controller.requireService(); UUID owner=service.resolveKnownPlayerName(name);
-            if ("list".equals(selector) || "status".equals(selector)) {
+            if ("status".equals(selector)) {
+                service.restoreStatusNow(owner).forEach(line -> source.sendSuccess(() -> Component.literal(line), false));
+                return 1;
+            }
+            if ("list".equals(selector)) {
                 source.sendSuccess(() -> Component.literal("正在核验 " + name + " 的恢复记录…"),false);
                 service.describeRestore(owner,"status".equals(selector)).whenComplete((lines,failure) -> source.getServer().execute(() -> {
                     if(failure!=null) source.sendFailure(Component.literal(reason(failure)));

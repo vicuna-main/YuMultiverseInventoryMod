@@ -83,7 +83,7 @@ final class RestorePlans {
                 CompoundTag entry=scope.getCompound(key.shareId());
                 if(key.scope().type().name().equals(entry.getString("scope_type")) && key.scope().id().equals(entry.getString("scope_id"))
                         && key.gameMode().name().equals(entry.getString("game_mode")))
-                    throw new IOException("该时间早于已有墓碑/补回/托管凭证；拒绝回滚已结案来源，请核对恢复中心记录");
+                    throw new IOException("该时间早于已有物品领取或托管凭证；拒绝回滚已结案来源，请核对恢复中心记录");
             }
         }
     }

@@ -27,12 +27,13 @@ class RevisionRecoveryScopeTest {
         store.commitRecovery(owner, store.nextRevision(owner), Map.of(), new RecoveryMutation(UUID.randomUUID(), -1, UUID.randomUUID(), payload));
     }
 
-    @Test void ordinaryPlayersAndNormalGraveCheckpointsKeepHistoricalRecovery() throws Exception {
+    @Test void legacyReceiptsStillFenceTheirItemScopeAfterExternalIntegrationIsRemoved() throws Exception {
         try (var store = new NbtProfileStore(directory, 20, 32)) {
             var recovery = new RevisionRecoveryService(store);
             assertDoesNotThrow(() -> recovery.requireNoRecoveryConflict(owner, List.of(key("minecraft:overworld", "inventory_contents"))));
             receipt(store, "grave_claim");
-            assertDoesNotThrow(() -> recovery.requireNoRecoveryConflict(owner, List.of(key("minecraft:overworld", "inventory_contents"))));
+            assertThrows(RevisionRecoveryService.RecoveryException.class,
+                    () -> recovery.requireNoRecoveryConflict(owner, List.of(key("minecraft:overworld", "inventory_contents"))));
         }
     }
 

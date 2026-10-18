@@ -4,6 +4,7 @@ import dev.yu.mwi.api.AdapterIds;
 import dev.yu.mwi.api.ItemEditSlotPolicy;
 import dev.yu.mwi.api.SharableAdapter;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.nbt.CompoundTag;
@@ -42,13 +43,18 @@ public final class CuriosInventoryAdapter implements SharableAdapter, ItemEditSl
     @Override
     public java.util.Optional<dev.yu.mwi.api.RecoveryEscrow> prepareRecoveryEscrow(ServerPlayer player, CompoundTag expected,
             HolderLookup.Provider lookup) {
+        return prepareRecoveryEscrow(player, expected, lookup, false);
+    }
+
+    private java.util.Optional<dev.yu.mwi.api.RecoveryEscrow> prepareRecoveryEscrow(ServerPlayer player, CompoundTag expected,
+             HolderLookup.Provider lookup, boolean rejected) {
         if (!net.neoforged.fml.ModList.get().getModContainerById("curios")
                 .map(mod -> java.util.Set.of("9.5.1", "9.5.1+1.21.1").contains(mod.getModInfo().getVersion().toString())).orElse(false))
             return java.util.Optional.empty();
         if (expected.getInt(SCHEMA) != SCHEMA_VERSION || !(expected.get(CAPABILITY) instanceof CompoundTag capability))
             return java.util.Optional.empty();
         ListTag slots = requireCompoundList(capability, "Curios");
-        boolean unavailable = false; Set<String> identifiers = new HashSet<>(); ListTag items = new ListTag();
+        boolean unavailable = rejected; Set<String> identifiers = new HashSet<>(); ListTag items = new ListTag();
         for (Tag tag : slots) {
             CompoundTag entry = (CompoundTag) tag; String identifier = entry.getString("Identifier");
             if (identifier.isBlank() || !identifiers.add(identifier)) throw invalid("invalid escrow slot identity");
@@ -107,6 +113,13 @@ public final class CuriosInventoryAdapter implements SharableAdapter, ItemEditSl
     }
 
     @Override
+    public void validateRestoreEnvironment(ServerPlayer player) {
+        ICuriosItemHandler handler = handler(player);
+        handler.getCurios();
+        CuriosRestoreGuard.requireEmptyDeliveryQueue(handler);
+    }
+
+    @Override
     public void apply(ServerPlayer player, CompoundTag data, HolderLookup.Provider lookup) {
         if (data == null) {
             throw invalid("payload is null");
@@ -118,9 +131,14 @@ public final class CuriosInventoryAdapter implements SharableAdapter, ItemEditSl
         if (!data.contains(CAPABILITY) && data.contains(LEGACY_INVENTORY, Tag.TAG_LIST)) {
             ListTag inventory = requireCompoundList(data, LEGACY_INVENTORY);
             validateLegacyInventory(handler, inventory, lookup);
-            handler.saveInventory(true);
-            handler.loadInventory(inventory.copy());
-            markForSynchronization(handler);
+            handler.getCurios();
+            CuriosRestoreGuard.requireEmptyDeliveryQueue(handler);
+            try (CuriosRestoreGuard guard = CuriosRestoreGuard.open(handler)) {
+                handler.saveInventory(true);
+                handler.loadInventory(inventory.copy());
+                markForSynchronization(handler);
+                if (!guard.rejected().isEmpty()) throw invalid("Legacy equipment rejected during restore; original profile retained for review");
+            }
             return;
         }
 
@@ -135,7 +153,24 @@ public final class CuriosInventoryAdapter implements SharableAdapter, ItemEditSl
             throw invalid("missing compound '" + CAPABILITY + "'");
         }
         validateCapability(handler, capability, lookup);
-        installCapability(handler, capability.copy());
+        List<ItemStack> rejected = installCapability(handler, capability.copy());
+        if (!rejected.isEmpty()) {
+            var escrow = prepareRecoveryEscrow(player, data, lookup, true).orElseThrow(
+                    () -> invalid("Rejected equipment has no verified complete escrow plan"));
+            List<ItemStack> sourceItems;
+            try { sourceItems = dev.yu.mwi.recovery.RecoveryItems.decode(escrow.items(), lookup); }
+            catch (java.io.IOException invalid) { throw new IllegalArgumentException("Incomplete equipment source", invalid); }
+            for (ItemStack stack : rejected) {
+                int match = -1;
+                for (int index = 0; index < sourceItems.size(); index++) {
+                    ItemStack source = sourceItems.get(index);
+                    if (ItemStack.isSameItemSameComponents(source, stack) && source.getCount() == stack.getCount()) { match = index; break; }
+                }
+                if (match < 0) throw invalid("Runtime rejected an item outside the original equipment source");
+                sourceItems = new java.util.ArrayList<>(sourceItems); sourceItems.remove(match);
+            }
+            throw new dev.yu.mwi.api.RecoveryEscrowRequiredException(escrow);
+        }
     }
 
     @Override
@@ -167,10 +202,16 @@ public final class CuriosInventoryAdapter implements SharableAdapter, ItemEditSl
         }
     }
 
-    private static void installCapability(ICuriosItemHandler handler, CompoundTag capability) {
-        handler.readTag(capability);
-        handler.reset();
-        markForSynchronization(handler);
+    private static List<ItemStack> installCapability(ICuriosItemHandler handler, CompoundTag capability) {
+        // Initialize the handler before inspecting its existing queue. Never erase older unexplained items.
+        handler.getCurios();
+        CuriosRestoreGuard.requireEmptyDeliveryQueue(handler);
+        try (CuriosRestoreGuard guard = CuriosRestoreGuard.open(handler)) {
+            handler.readTag(capability);
+            handler.reset();
+            markForSynchronization(handler);
+            return guard.rejected();
+        }
     }
 
     private static void markForSynchronization(ICuriosItemHandler handler) {

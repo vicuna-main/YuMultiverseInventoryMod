@@ -330,10 +330,222 @@ public final class AutomaticRecoveryGameTests {
                 helper.assertTrue(store(helper).listRevisions(owner).isEmpty(),"Rejected application cannot allocate revision journals");
                 helper.assertTrue(Arrays.equals(original,Files.readAllBytes(profile(helper,owner))),"Rejected application cannot overwrite original");
                 helper.assertTrue(RecoveryLoginFence.held(player) && !RecoveryLoginFence.movementBlocked(player),"Held player must keep a movable protected help session");
-                player.server.getPlayerList().remove(player);
+                var rcon = new net.minecraft.server.rcon.RconConsoleSource(player.server);
+                player.server.getCommands().getDispatcher().execute("mwi restore budget_mwi status", rcon.createCommandSourceStack());
+                helper.assertTrue(rcon.getCommandResponse().contains("ACTION_REQUIRED") && rcon.getCommandResponse().contains("inventory_contents@"),
+                        "RCON must return failure state and actual required scope in the same command");
+                store(helper).save(new ProfileKey(owner, new ScopeKey(ScopeKey.Type.GROUP,"unrelated"), GameModeBucket.SHARED,"inventory_contents"),inventory(helper,10),204);
+                flight[0]=service(helper).inspectAutomaticRecovery(owner,true);
             } catch(Exception failure) { throw new RuntimeException(failure); }
-        }).thenSucceed();
+        }).thenWaitUntil(() -> helper.assertTrue(flight[0].isDone(),"Waiting for unrelated source retry"))
+                .thenExecute(() -> {
+                    try {
+                        helper.assertTrue("ACTION_REQUIRED".equals(store(helper).activationTask(owner).getString("state")),"An unrelated group cannot reset the budget");
+                        store(helper).save(key(owner),inventory(helper,3),205);
+                        flight[0]=service(helper).inspectAutomaticRecovery(owner,true);
+                    } catch(Exception failure) { throw new RuntimeException(failure); }
+                }).thenWaitUntil(() -> helper.assertTrue(!RecoveryLoginFence.held(player),"Corrected required source must allow reactivation"))
+                .thenExecute(() -> {
+                    helper.assertTrue(player.getInventory().countItem(Items.DIAMOND)==3,"Only corrected original scope may activate");
+                    player.server.getPlayerList().remove(player);
+                }).thenSucceed();
     }
+    @GameTest(template = "empty", timeoutTicks = 1200)
+    public static void legacyAbsorptionSurvivesActivationSaveAndRejoin(GameTestHelper helper) throws Exception {
+        UUID owner = UUID.randomUUID();
+        CompoundTag health = new CompoundTag(); health.putFloat("health", 20); health.putFloat("absorption", 10);
+        ProfileKey healthKey = new ProfileKey(owner, new ScopeKey(ScopeKey.Type.GROUP, "default"), GameModeBucket.SHARED, "health");
+        store(helper).save(healthKey, health, 100);
+        store(helper).save(key(owner), inventory(helper, 8), 101);
+        ServerPlayer player = join(helper, owner, "shield_mwi");
+        ServerPlayer[] rejoined = new ServerPlayer[1];
+        helper.startSequence().thenWaitUntil(() -> helper.assertTrue(!RecoveryLoginFence.held(player), "Shield source must activate"))
+                .thenExecute(() -> {
+                    try {
+                        helper.assertTrue(player.getAbsorptionAmount() == 10, "Existing shield must not be clamped to zero");
+                        helper.assertTrue(player.getAttribute(net.minecraft.world.entity.ai.attributes.Attributes.MAX_ABSORPTION).getBaseValue() == 0,
+                                "Legacy shield must not invent a permanent capacity source");
+                        service(helper).checkpointImmediately(player, "shield_roundtrip");
+                        helper.assertTrue(store(helper).load(healthKey).orElseThrow().payload().getInt("schema") == 2, "Capacity dependency must be persisted");
+                        player.server.getPlayerList().remove(player);
+                        rejoined[0] = join(helper, owner, "shield_mwi");
+                    } catch (Exception failure) { throw new RuntimeException(failure); }
+                }).thenWaitUntil(() -> helper.assertTrue(!RecoveryLoginFence.held(rejoined[0]), "Shield source must reactivate"))
+                .thenExecute(() -> {
+                    helper.assertTrue(rejoined[0].getAbsorptionAmount() == 10, "Shield must survive reconnect");
+                    helper.assertTrue(rejoined[0].getInventory().countItem(Items.DIAMOND) == 8, "Shield recovery cannot duplicate inventory");
+                    var adapter = new dev.yu.mwi.adapter.vanilla.HealthAdapter();
+                    adapter.clear(rejoined[0]);
+                    CompoundTag empty = new CompoundTag(); empty.putFloat("health", 20); empty.putFloat("absorption", 0);
+                    adapter.apply(rejoined[0], empty, rejoined[0].registryAccess()); adapter.dependenciesApplied(rejoined[0]);
+                    helper.assertTrue(rejoined[0].getMaxAbsorption() == 0 && rejoined[0].getAbsorptionAmount() == 0,
+                            "Changing the health scope must remove its temporary shield capacity");
+                    rejoined[0].server.getPlayerList().remove(rejoined[0]);
+                }).thenSucceed();
+    }
+
+    @GameTest(template = "empty", timeoutTicks = 1200)
+    public static void rejectedCuriosEquipmentIsEscrowedOnceWithoutQueuedCopies(GameTestHelper helper) throws Exception {
+        UUID owner = UUID.randomUUID();
+        CompoundTag source = new CompoundTag(); source.putInt("schema", 2);
+        CompoundTag capability = new CompoundTag(), entry = new CompoundTag(), stacks = new CompoundTag();
+        entry.putString("Identifier", "belt");
+        for (String kind : List.of("Stacks", "Cosmetics")) {
+            CompoundTag inventory = new CompoundTag(); inventory.putInt("Size", 1); ListTag items = new ListTag();
+            if (kind.equals("Stacks")) {
+                CompoundTag item = (CompoundTag) new ItemStack(Items.DIRT).save(helper.getLevel().registryAccess());
+                item.putInt("Slot", 0); items.add(item);
+            }
+            inventory.put("Items", items); stacks.put(kind, inventory);
+        }
+        entry.put("StacksHandler", stacks); ListTag slots = new ListTag(); slots.add(entry);
+        capability.put("Curios", slots); source.put("capability", capability);
+        ProfileKey curios = new ProfileKey(owner, new ScopeKey(ScopeKey.Type.GROUP, "default"), GameModeBucket.SHARED, "curios");
+        store(helper).save(curios, source, 100); store(helper).save(key(owner), inventory(helper, 4), 101);
+        ServerPlayer player = join(helper, owner, "reject_mwi");
+        helper.startSequence().thenWaitUntil(() -> helper.assertTrue(!RecoveryLoginFence.held(player), "Rejected item must not block the whole player"))
+                .thenExecute(() -> {
+                    try {
+                        player.setGameMode(net.minecraft.world.level.GameType.SURVIVAL);
+                        var records = store(helper).listRecoveries(owner);
+                        helper.assertTrue(records.size() == 1, "One durable escrow source only");
+                        var handler = top.theillusivec4.curios.api.CuriosApi.getCuriosInventory(player).orElseThrow();
+                        handler.handleInvalidStacks();
+                        helper.assertTrue(player.getInventory().countItem(Items.DIRT) == 0, "No rebuilt duplicate in Curios delivery queue");
+                        var center = service(helper).recoveryCenter(); var preview = center.preview(player, records.getFirst().sourceId());
+                        helper.assertTrue(center.claim(player, preview) == 1, "Exact original rejected item must be claimable once");
+                        boolean refused = false;
+                        try { center.claim(player, preview); } catch (java.io.IOException expected) { refused = true; }
+                        helper.assertTrue(refused, "Repeated preview cannot grant another item");
+                        handler.handleInvalidStacks();
+                        helper.assertTrue(player.getInventory().countItem(Items.DIRT) == 1 && player.getInventory().countItem(Items.DIAMOND) == 4,
+                                "Escrow and delayed delivery must conserve inventory");
+                        player.server.getPlayerList().remove(player);
+                    } catch (Exception failure) { throw new RuntimeException(failure); }
+                }).thenSucceed();
+    }
+
+    @GameTest(template = "empty", timeoutTicks = 1200)
+    public static void existingCuriosQueueStaysFencedDuringRepeatedRecovery(GameTestHelper helper) throws Exception {
+        UUID owner = UUID.randomUUID(); ServerPlayer player = join(helper, owner, "queue_mwi");
+        top.theillusivec4.curios.api.type.capability.ICuriosItemHandler[] queuedHandler = new top.theillusivec4.curios.api.type.capability.ICuriosItemHandler[1];
+        InventoryIsolationService.RestoreCommandTask[] task = new InventoryIsolationService.RestoreCommandTask[1];
+        helper.startSequence().thenWaitUntil(() -> helper.assertTrue(!RecoveryLoginFence.held(player),"Waiting for queue test login"))
+                .thenExecute(() -> {
+                    try {
+                        var handler = top.theillusivec4.curios.api.CuriosApi.getCuriosInventory(player).orElseThrow(); queuedHandler[0] = handler;
+                        service(helper).checkpointImmediately(player,"queue_test_target");
+                        String target = "#" + store(helper).restorePoints(owner).getFirst().revision();
+                        handler.loseInvalidStack(new ItemStack(Items.EMERALD,3));
+                        task[0] = service(helper).requestRestore(owner,target,"gametest");
+                        handler.handleInvalidStacks();
+                        helper.assertTrue(player.getInventory().countItem(Items.EMERALD)==0,"Held queue cannot deliver items");
+                    } catch(Exception failure) { throw new RuntimeException(failure); }
+                }).thenWaitUntil(() -> helper.assertTrue(task[0].completion().isDone(),"Waiting for pending queue rejection"))
+                .thenExecute(() -> {
+                    try {
+                        helper.assertTrue(RecoveryLoginFence.held(player),"Unknown existing queue must block activation");
+                        var handler = queuedHandler[0];
+                        handler.handleInvalidStacks();
+                        var field = handler.getClass().getDeclaredField("curioInventory"); field.setAccessible(true);
+                        Object inventory = field.get(handler);
+                        var queueField = inventory.getClass().getDeclaredField("invalidStacks"); queueField.setAccessible(true);
+                        List<?> queue = (List<?>)queueField.get(inventory);
+                        helper.assertTrue(queue.size()==1 && ((ItemStack)queue.getFirst()).getCount()==3,"Original pending queue must remain unchanged");
+                        helper.assertTrue(player.getInventory().countItem(Items.EMERALD)==0,"Recovery cannot deliver unexplained items");
+                        var rcon = new net.minecraft.server.rcon.RconConsoleSource(player.server);
+                        player.server.getCommands().getDispatcher().execute("mwi restore queue_mwi status",rcon.createCommandSourceStack());
+                        helper.assertTrue(rcon.getCommandResponse().contains("pending items") && rcon.getCommandResponse().contains("RESULT_AVAILABLE"),
+                                "Durable command result and exact queue failure must be queryable from RCON");
+                        dev.yu.mwi.recovery.RecoveryMenu.open(player,null,0);
+                        helper.assertTrue(player.containerMenu==player.inventoryMenu,"Held help must not require a normal recovery menu session");
+                        player.server.getPlayerList().remove(player);
+                    } catch(Exception failure) { throw new RuntimeException(failure); }
+                }).thenSucceed();
+    }
+
+    @GameTest(template = "empty", timeoutTicks = 1200)
+    public static void keepInventoryDeathRespawnSaveAndRejoinNeedsNoExternalRecovery(GameTestHelper helper) throws Exception {
+        UUID owner = UUID.randomUUID(); ServerPlayer[] player = {join(helper,owner,"death_mwi")};
+        helper.startSequence().thenWaitUntil(() -> helper.assertTrue(!RecoveryLoginFence.held(player[0]),"Waiting for death test login"))
+                .thenExecute(() -> {
+                    try {
+                        player[0].serverLevel().getGameRules().getRule(net.minecraft.world.level.GameRules.RULE_KEEPINVENTORY).set(true,player[0].server);
+                        player[0].setGameMode(net.minecraft.world.level.GameType.SURVIVAL);
+                        player[0].getInventory().setItem(0,new ItemStack(Items.DIAMOND,6));
+                        service(helper).checkpointImmediately(player[0],"before_keep_inventory_death");
+                        player[0].die(player[0].damageSources().genericKill());
+                        player[0]=player[0].server.getPlayerList().respawn(player[0],false,net.minecraft.world.entity.Entity.RemovalReason.KILLED);
+                    } catch(Exception failure) { throw new RuntimeException(failure); }
+                }).thenIdle(3).thenExecute(() -> {
+                    try {
+                        helper.assertTrue(player[0].getInventory().countItem(Items.DIAMOND)==6,"Respawn must keep exactly the original inventory");
+                        helper.assertTrue(store(helper).listRecoveries(owner).isEmpty(),"Death must not create an external source or second item grant");
+                        service(helper).checkpointImmediately(player[0],"after_keep_inventory_respawn");
+                        player[0].server.getPlayerList().remove(player[0]); player[0]=join(helper,owner,"death_mwi");
+                    } catch(Exception failure) { throw new RuntimeException(failure); }
+                }).thenWaitUntil(() -> helper.assertTrue(!RecoveryLoginFence.held(player[0]),"Waiting for post-death rejoin"))
+                .thenExecute(() -> {
+                    helper.assertTrue(player[0].getInventory().countItem(Items.DIAMOND)==6,"Keep-inventory result must survive save and rejoin");
+                    player[0].server.getPlayerList().remove(player[0]);
+                }).thenSucceed();
+    }
+
+    @GameTest(template = "empty", timeoutTicks = 1200)
+    public static void uninstalledEffectsArchiveOriginalBeforeActivatingKnownEffects(GameTestHelper helper) throws Exception {
+        UUID owner=UUID.randomUUID();
+        CompoundTag effects=new CompoundTag(); ListTag entries=new ListTag();
+        entries.add(new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.NIGHT_VISION,-1).save());
+        entries.add(TagParser.parseTag("{id:'removed_example:vanished',duration:300}")); effects.put("effects",entries);
+        ProfileKey effectsKey=new ProfileKey(owner,new ScopeKey(ScopeKey.Type.GROUP,"default"),GameModeBucket.SHARED,"potion_effects");
+        store(helper).save(effectsKey,effects,101);
+        ServerPlayer player=join(helper,owner,"effect_mwi");
+        helper.startSequence().thenWaitUntil(() -> helper.assertTrue(!RecoveryLoginFence.held(player),"Removed mod effect must not block all inventory"))
+                .thenExecute(() -> {
+                    try {
+                        helper.assertTrue(player.hasEffect(net.minecraft.world.effect.MobEffects.NIGHT_VISION),"Known effects must remain active");
+                        helper.assertTrue(store(helper).load(effectsKey).orElseThrow().payload().getList("effects",Tag.TAG_COMPOUND).size()==1,"Only removed mod effect may detach");
+                        boolean archived=false;
+                        try(var paths=Files.walk(root(helper).resolve("archives/removed-effects"))) {
+                            for(Path path:paths.filter(p -> p.toString().endsWith(".dat")).toList()) {
+                                CompoundTag archive=NbtIo.readCompressed(path,NbtAccounter.create(1024*1024));
+                                if(effects.equals(archive.getCompound("details").getCompound("source_payload"))) archived=true;
+                            }
+                        }
+                        helper.assertTrue(archived,"Exact original effect payload must be retained in the committed archive");
+                        player.server.getPlayerList().remove(player);
+                    } catch(Exception failure) { throw new RuntimeException(failure); }
+                }).thenSucceed();
+    }
+
+    @GameTest(template="empty",timeoutTicks=800)
+    public static void historicalExternalSourceRemainsReadOnlyAndUnchanged(GameTestHelper helper) throws Exception {
+        UUID owner=UUID.randomUUID(), source=UUID.randomUUID(); ServerPlayer player=join(helper,owner,"legacy_mwi");
+        helper.startSequence().thenWaitUntil(() -> helper.assertTrue(!RecoveryLoginFence.held(player),"Waiting for legacy record test login"))
+                .thenExecute(() -> {
+                    try {
+                        player.setGameMode(net.minecraft.world.level.GameType.SURVIVAL);
+                        CompoundTag payload=new CompoundTag(),identity=new CompoundTag(),evidence=new CompoundTag();
+                        evidence.putString("provider","removed_external_mod"); evidence.putString("type","historical_transfer");
+                        identity.put("evidence",evidence); identity.put("scope",new CompoundTag()); payload.put("identity",identity);
+                        payload.putString("state","AVAILABLE"); payload.putBoolean("notify_ready",true);
+                        payload.put("remaining",dev.yu.mwi.recovery.RecoveryItems.encode(List.of(new ItemStack(Items.DIAMOND)),player.registryAccess()));
+                        store(helper).commitRecovery(owner,store(helper).nextRevision(owner),Map.of(),new RecoveryMutation(source,-1,UUID.randomUUID(),payload));
+                        var before=store(helper).loadRecovery(owner,source).orElseThrow(); var center=service(helper).recoveryCenter();
+                        var preview=center.preview(player,source);
+                        helper.assertTrue("HISTORY".equals(preview.state()) && !center.shouldNotify(player,source),"Legacy external sources are read-only and do not notify");
+                        boolean denied=false;try{center.claim(player,preview);}catch(java.io.IOException expected){denied=true;}
+                        helper.assertTrue(denied,"External grant cannot run");
+                        denied=false;try{center.review(player,source,before.checksum(),false,"test","test close");}catch(java.io.IOException expected){denied=true;}
+                        helper.assertTrue(denied,"External receipt cannot be rewritten by native close");
+                        var after=store(helper).loadRecovery(owner,source).orElseThrow();
+                        helper.assertTrue(before.checksum().equals(after.checksum()) && before.version()==after.version(),"Historical source and receipt must remain unchanged");
+                        helper.assertTrue(player.getInventory().countItem(Items.DIAMOND)==0,"No legacy item may be delivered");
+                        player.server.getPlayerList().remove(player);
+                    }catch(Exception failure){throw new RuntimeException(failure);}
+                }).thenSucceed();
+    }
+
     private static InventoryIsolationService service(GameTestHelper helper) throws Exception {
         var field = RecoveryLoginFence.class.getDeclaredField("SERVICES"); field.setAccessible(true);
         return (InventoryIsolationService) ((Map<?, ?>) field.get(null)).get(helper.getLevel().getServer());

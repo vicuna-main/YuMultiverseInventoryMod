@@ -1,6 +1,6 @@
 package dev.yu.mwi.recovery;
 
-import dev.yu.mwi.api.RecoveryBridgeV1;
+import dev.yu.mwi.recovery.RecoveryServices;
 import dev.yu.mwi.storage.RecoveryNoticeStore;
 import net.minecraft.network.chat.*;
 import net.minecraft.server.MinecraftServer;
@@ -48,7 +48,7 @@ public final class RecoveryNotifications {
         try {
             if (dev.yu.mwi.platform.RecoveryLoginFence.held(player)) { pending.put(owner, task); return; }
             if (!player.isAlive() || !authenticated(player)) { pending.put(owner, task); return; }
-            RecoveryCenter center = RecoveryBridgeV1.service(player);
+            RecoveryCenter center = RecoveryServices.service(player);
             String session = center.sessionToken(player);
             if (!session.equals(task.session)) { task.session = session; task.due = now + 1000; pending.put(owner, task); return; }
             if (task.refresh) {
@@ -97,7 +97,7 @@ public final class RecoveryNotifications {
         var service = SERVICES.get(player.server);
         if (service == null) return;
         try {
-            var payload = RecoveryBridgeV1.service(player).get(player.getUUID(), source).payload();
+            var payload = RecoveryServices.service(player).get(player.getUUID(), source).payload();
             long epoch = Math.max(payload.getLong("created_at"), payload.getLong("reviewed_at"));
             var notice = service.notices.read(player.getUUID(), source, epoch);
             service.notices.write(player.getUUID(), source, new RecoveryNoticeStore.Notice(

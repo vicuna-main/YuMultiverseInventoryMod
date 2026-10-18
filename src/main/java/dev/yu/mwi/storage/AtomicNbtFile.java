@@ -30,7 +30,7 @@ final class AtomicNbtFile {
         return read(file, MAX_TRANSACTION_BYTES);
     }
 
-    private static CompoundTag read(Path file, long maxBytes) throws IOException {
+    static CompoundTag read(Path file, long maxBytes) throws IOException {
         return snapshot(file, maxBytes).parse();
     }
 

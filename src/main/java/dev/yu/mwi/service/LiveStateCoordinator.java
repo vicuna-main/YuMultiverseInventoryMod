@@ -96,6 +96,7 @@ final class LiveStateCoordinator {
             long synchronizationStarted = System.nanoTime();
             try {
                 settleEquipmentState(unique, player);
+                unique.forEach(adapter -> adapter.dependenciesApplied(player));
                 synchronize(
                         unique, player, suspendAdvancementListeners, listenerResumeAttempted);
                 synchronizedState = true;

@@ -1954,22 +1954,34 @@ public final class NbtProfileStore implements ProfileStore {
     private Path headsPath(UUID owner) { return root.resolve("committed_heads").resolve(owner + ".dat"); }
 
     @Override public CompoundTag activationTask(UUID owner) throws IOException {
-        Path file = root.resolve("activation_tasks").resolve(owner + ".dat");
+        return readStatus(owner, "activation_tasks", "task");
+    }
+    @Override public CompoundTag restoreResult(UUID owner) throws IOException {
+        return readStatus(owner, "restore_results", "result");
+    }
+    private CompoundTag readStatus(UUID owner, String directory, String field) throws IOException {
+        Path file = root.resolve(directory).resolve(owner + ".dat");
         if (!Files.exists(file)) return new CompoundTag();
-        CompoundTag document = AtomicNbtFile.read(file);
+        CompoundTag document = AtomicNbtFile.read(file, 256 * 1024);
         RecoveryIncidentJournal.verify(file, document);
         if (document.getInt("schema_version") != 1 || !document.hasUUID("player_uuid")
-                || !owner.equals(document.getUUID("player_uuid")) || !document.contains("task", Tag.TAG_COMPOUND))
+                || !owner.equals(document.getUUID("player_uuid")) || !document.contains(field, Tag.TAG_COMPOUND))
             throw new ProfileCorruptionException(file, "Invalid activation task identity");
-        return document.getCompound("task").copy();
+        return document.getCompound(field).copy();
     }
 
     @Override public void saveActivationTask(UUID owner, CompoundTag task) throws IOException {
+        saveStatus(owner, "activation_tasks", "task", task);
+    }
+    @Override public void saveRestoreResult(UUID owner, CompoundTag result) throws IOException {
+        saveStatus(owner, "restore_results", "result", result);
+    }
+    private void saveStatus(UUID owner, String directory, String field, CompoundTag value) throws IOException {
         CompoundTag document = new CompoundTag();
         document.putInt("schema_version", 1); document.putUUID("player_uuid", owner);
-        document.put("task", task.copy()); document.putLong("updated_at", Instant.now().toEpochMilli());
+        document.put(field, value.copy()); document.putLong("updated_at", Instant.now().toEpochMilli());
         RecoveryIncidentJournal.seal(document);
-        AtomicNbtFile.write(root.resolve("activation_tasks").resolve(owner + ".dat"), document, faultInjector);
+        AtomicNbtFile.write(root.resolve(directory).resolve(owner + ".dat"), document, faultInjector);
     }
     private Path committedPath(UUID owner, long revision) {
         return root.resolve("committed_batches").resolve(owner.toString()).resolve(revision + ".dat");
